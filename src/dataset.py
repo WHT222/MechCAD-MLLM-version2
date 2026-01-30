@@ -21,7 +21,8 @@ class OmniCADDataset(Dataset):
     """
     为 Omni-CAD 设计的多模态数据集，能够加载 CAD 向量序列、文本描述和8个视图的图像。
     """
-    def __init__(self, cad_vec_dir, text_dir, image_dir, split='all', sample_limit=None):
+    def __init__(self, cad_vec_dir, text_dir, image_dir, split='all', sample_limit=None,
+                 category_start=0, category_end=None):
         """
         初始化 Omni-CAD 数据集。
 
@@ -31,12 +32,16 @@ class OmniCADDataset(Dataset):
             image_dir (str): 图像文件的根目录 (e.g., 'data/Omni-CAD/step_img').
             split (str): 数据集划分 (当前版本中未使用，默认为 'all').
             sample_limit (int, optional): 限制加载的样本数量，用于快速测试。
+            category_start (int): 起始类别编号 (默认0，即'0000').
+            category_end (int, optional): 结束类别编号 (包含)。None表示加载所有可用类别。
         """
         self.cad_vec_dir = cad_vec_dir
         self.text_dir = text_dir
         self.image_dir = image_dir
         self.split = split
         self.sample_limit = sample_limit
+        self.category_start = category_start
+        self.category_end = category_end
         self.num_views = 8
 
         self.samples = []
@@ -54,24 +59,47 @@ class OmniCADDataset(Dataset):
     def _load_samples(self):
         """
         遍历 cad_vec 目录，收集所有 .h5 文件的路径作为样本。
+        支持按类别范围筛选。
         """
         print(f"正在从 '{self.cad_vec_dir}' 收集 CAD 向量样本...")
         if not os.path.isdir(self.cad_vec_dir):
             raise FileNotFoundError(f"CAD 向量目录不存在: {self.cad_vec_dir}")
 
-        h5_files = glob.glob(os.path.join(self.cad_vec_dir, '**', '*.h5'), recursive=True)
-        
+        # 获取所有类别子目录
+        all_categories = sorted([d for d in os.listdir(self.cad_vec_dir)
+                                  if os.path.isdir(os.path.join(self.cad_vec_dir, d))])
+
+        # 筛选类别范围
+        if self.category_end is not None:
+            selected_categories = [c for c in all_categories
+                                   if self.category_start <= int(c) <= self.category_end]
+            print(f"选择类别范围: {self.category_start:04d} - {self.category_end:04d}")
+        else:
+            selected_categories = [c for c in all_categories
+                                   if int(c) >= self.category_start]
+            print(f"选择类别范围: {self.category_start:04d} - 全部")
+
+        print(f"找到 {len(selected_categories)} 个类别: {selected_categories[:5]}{'...' if len(selected_categories) > 5 else ''}")
+
+        # 收集选定类别中的样本
+        for category in selected_categories:
+            category_path = os.path.join(self.cad_vec_dir, category)
+            h5_files = glob.glob(os.path.join(category_path, '*.h5'))
+
+            for h5_path in h5_files:
+                filename = os.path.splitext(os.path.basename(h5_path))[0]  # e.g., "00000007_00001"
+                sample_id = f"{category}/{filename}"  # e.g., "0000/00000007_00001"
+                self.samples.append({
+                    'id': sample_id,
+                    'h5_path': h5_path,
+                    'category': category,
+                    'filename': filename
+                })
+
         if self.sample_limit:
-            h5_files = h5_files[:self.sample_limit]
-        
-        for h5_path in h5_files:
-            relative_path = os.path.relpath(h5_path, self.cad_vec_dir)
-            sample_id = os.path.splitext(relative_path)[0].replace(os.path.sep, '/')
-            self.samples.append({
-                'id': sample_id,
-                'h5_path': h5_path
-            })
-        print(f"收集到 {len(self.samples)} 个样本。" )
+            self.samples = self.samples[:self.sample_limit]
+
+        print(f"收集到 {len(self.samples)} 个样本。")
 
     def _load_text_captions(self):
         """
@@ -142,16 +170,18 @@ class OmniCADDataset(Dataset):
 
     def __getitem__(self, idx):
         sample_info = self.samples[idx]
-        sample_id = sample_info['id'] # e.g., '0000/00000007_00001'
+        sample_id = sample_info['id']  # e.g., '0000/00000007_00001'
         h5_path = sample_info['h5_path']
+        category = sample_info['category']  # e.g., '0000'
+        filename = sample_info['filename']  # e.g., '00000007_00001'
 
         # 1. 加载并转换CAD向量序列
         try:
             with h5py.File(h5_path, 'r') as fp:
-                cad_vec_17d = fp['vec'][:] #type:ignore
-            
+                cad_vec_17d = fp['vec'][:]  # type:ignore
+
             # 将17维向量序列转换为13维
-            cad_vec_13d = np.array([self._convert_17d_to_13d(v) for v in cad_vec_17d], dtype=np.int32)#type:ignore
+            cad_vec_13d = np.array([self._convert_17d_to_13d(v) for v in cad_vec_17d], dtype=np.int32)  # type:ignore
 
             # 确保序列长度统一，进行填充
             padded_cad_vec = np.full((MAX_TOTAL_LEN, 13), EOS_IDX, dtype=np.int32)
@@ -164,14 +194,13 @@ class OmniCADDataset(Dataset):
             cad_tensor = torch.full((MAX_TOTAL_LEN, 13), EOS_IDX, dtype=torch.long)
 
         # 2. 加载文本描述
-        # sample_id 本身就是用于匹配的键
-        model_id_key = sample_id
-        text_caption = self.text_captions.get(model_id_key, "No description available.")
+        text_caption = self.text_captions.get(sample_id, "No description available.")
 
         # 3. 加载8个视图的图像
+        # 图像路径格式: step_img/{category}/{filename}_{view:03d}.png
         image_tensors = []
         for i in range(self.num_views):
-            img_path = os.path.join(self.image_dir, f"{sample_id}_{i:03d}.png")
+            img_path = os.path.join(self.image_dir, category, f"{filename}_{i:03d}.png")
             try:
                 if os.path.exists(img_path):
                     image = Image.open(img_path).convert('RGB')

@@ -1,13 +1,12 @@
 import torch
 import torch.nn as nn
+import numpy as np
 from transformers import AutoProcessor, LlavaForConditionalGeneration
 from transformers.utils.quantization_config import BitsAndBytesConfig
 from dataclasses import dataclass
 from PIL import Image
-from typing import List
+from typing import List, Dict, Any, Optional
 
-# cadlib.macro 和其他本地导入可能需要调整 sys.path
-# 这在数据集中处理，但在模型文件中也是好的实践。
 import sys
 import os
 project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -190,28 +189,46 @@ class MechCADModel(nn.Module):
             quantization_config=quantization_config,
             device_map="auto"
         )
-        self.llava_model.eval()  # Freeze the MLLM encoder
+        self.llava_model.eval()  # 冻结 LLaVA 模型参数
 
         # --- Decoder ---
         self.llm2cad_decoder = LLM2CADDecoder(cfg)
 
-    def forward(self, batch):
+    def _denormalize_image(self, img_tensor: torch.Tensor) -> np.ndarray:
+        """将归一化的图像张量转换回 PIL 可用的 numpy 数组。"""
+        mean = np.array([0.485, 0.456, 0.406])
+        std = np.array([0.229, 0.224, 0.225])
+        img_np = img_tensor.permute(1, 2, 0).cpu().numpy()
+        img_np = (img_np * std + mean) * 255
+        img_np = np.clip(img_np, 0, 255).astype(np.uint8)
+        return img_np
+
+    def forward(self, batch: Dict[str, Any]) -> Dict[str, torch.Tensor]:
         """
         处理来自 OmniCADDataset 的一个批次。
+
+        Args:
+            batch: 包含 'images', 'text_caption', 'cad_sequence' 的字典
+
+        Returns:
+            包含 'command_logits', 'args_logits', 'angle_logits', 'pos_logits' 的字典
         """
         images_tensor = batch['images']  # (B, 8, C, H, W)
         texts = batch['text_caption']    # 字符串列表
-        
+        batch_size = images_tensor.size(0)
+
         # --- 为 LLaVA 准备输入 ---
-        # 为简起见，我们仅使用每个 CAD 模型的第一个视图。
-        # 更高级的策略可以涉及多个 <image> 令牌。
-        pil_images = [Image.fromarray((images_tensor[i, 0].permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)) for i in range(len(texts))]
-        
+        # 使用第一个视图，反归一化后转为 PIL 图像
+        pil_images = []
+        for i in range(batch_size):
+            img_np = self._denormalize_image(images_tensor[i, 0])
+            pil_images.append(Image.fromarray(img_np))
+
         # 创建 LLaVA 风格的提示
         prompts = [f"USER: <image>\n{caption} ASSISTANT:" for caption in texts]
 
         inputs = self.processor(text=prompts, images=pil_images, return_tensors="pt", padding=True)
-        
+
         # 将输入移到与模型相同的设备上
         for k, v in inputs.items():
             if isinstance(v, torch.Tensor):
@@ -221,17 +238,21 @@ class MechCADModel(nn.Module):
         with torch.no_grad():
             outputs = self.llava_model(**inputs, output_hidden_states=True)
             llm_features = outputs.hidden_states[-1]
-            
-            # 处理器的注意掩码对应于提示的文本部分。
-            # 我们直接将其用作解码器的存储键填充掩码。
-            # LLaVA 内部为其自己的注意处理完整掩码。
             memory_key_padding_mask = (inputs.attention_mask == 0)
 
         # --- 解码为 CAD 序列 ---
-        # 将解码器移到设备并匹配精度（如需要）
         self.llm2cad_decoder.to(llm_features.device, dtype=llm_features.dtype)
-        
-        return self.llm2cad_decoder(llm_features, memory_key_padding_mask)
+
+        command_logits, args_features, angle_logits, pos_logits = self.llm2cad_decoder(
+            llm_features, memory_key_padding_mask
+        )
+
+        return {
+            'command_logits': command_logits,
+            'args_logits': args_features,
+            'angle_logits': angle_logits,
+            'pos_logits': pos_logits
+        }
 
 # --- 示例用法 ---
 if __name__ == '__main__':
@@ -268,14 +289,14 @@ if __name__ == '__main__':
 
         # 4. 执行前向传播
         print("\n对真实批次执行前向传播...")
-        command_logits, args_features, angle_logits, pos_logits = model(real_batch)
+        outputs = model(real_batch)
 
         # 5. 打印输出形状以验证
         print("\n--- 输出形状 ---")
-        print(f"命令逻辑: {command_logits.shape}")
-        print(f"参数特征:  {args_features.shape}")
-        print(f"角度逻辑:   {angle_logits.shape}")
-        print(f"位置逻辑:  {pos_logits.shape}")
+        print(f"命令逻辑: {outputs['command_logits'].shape}")
+        print(f"参数特征:  {outputs['args_logits'].shape}")
+        print(f"角度逻辑:   {outputs['angle_logits'].shape}")
+        print(f"位置逻辑:  {outputs['pos_logits'].shape}")
         
         # 预期形状
         batch_size = len(real_batch['id'])
