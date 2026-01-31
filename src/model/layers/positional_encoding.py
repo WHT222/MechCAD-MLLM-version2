@@ -17,7 +17,7 @@ class PositionalEncodingSinCos(nn.Module):
         self.register_buffer('pe', pe)
 
     def forward(self, x):
-        x = x + self.pe[:x.size(0), :]
+        x = x + self.pe[:x.size(0), :]#type:ignore
         return self.dropout(x)
 
 
@@ -38,6 +38,6 @@ class PositionalEncodingLUT(nn.Module):# 位置编码：学习型查找表形式
         nn.init.kaiming_normal_(self.pos_embed.weight, mode="fan_in")
 
     def forward(self, x):
-        pos = self.position[:x.size(0)]
+        pos = self.position[:x.size(0)]#type:ignore
         x = x + self.pos_embed(pos)
         return self.dropout(x)
