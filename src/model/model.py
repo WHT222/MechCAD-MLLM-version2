@@ -151,7 +151,13 @@ class LLM2CADDecoder(nn.Module):
         self.command_decoder = CommandDecoder(cfg)
         self.args_decoder = ArgsDecoder(cfg)
 
+        # 确保所有参数为 float32 (避免 LLaVA float16 导致溢出)
+        self.float()
+
     def forward(self, llm_features, memory_key_padding_mask=None):
+        # 转换输入为 float32
+        llm_features = llm_features.float()
+
         z = self.adapter(llm_features)
         z = z.permute(1, 0, 2)  # [LLM_Seq_Len, Batch, d_model]
 
@@ -248,7 +254,8 @@ class MechCADModel(nn.Module):
             memory_key_padding_mask = (inputs.attention_mask == 0)
 
         # --- 解码为 CAD 序列 ---
-        self.llm2cad_decoder.to(llm_features.device, dtype=llm_features.dtype)
+        # 只移动到设备，不改变 dtype (保持 float32 以避免溢出)
+        self.llm2cad_decoder.to(llm_features.device)
 
         command_logits, args_features, angle_logits, pos_logits = self.llm2cad_decoder(
             llm_features, memory_key_padding_mask

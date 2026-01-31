@@ -117,6 +117,9 @@ class CADLoss(nn.Module):
         """计算命令分类损失"""
         B, S, C = logits.shape
 
+        # 转换为 float32 以提高数值稳定性
+        logits = logits.float()
+
         # 展平计算 (使用 reshape 替代 view 以处理非连续张量)
         logits_flat = logits.reshape(-1, C)
         targets_flat = targets.reshape(-1).long()
@@ -124,6 +127,10 @@ class CADLoss(nn.Module):
 
         # 交叉熵损失
         loss = F.cross_entropy(logits_flat, targets_flat, reduction='none')
+
+        # 检查 NaN 并替换
+        loss = torch.where(torch.isnan(loss), torch.zeros_like(loss), loss)
+
         loss = (loss * mask_flat).sum() / (mask_flat.sum() + 1e-8)
 
         return loss
@@ -141,24 +148,31 @@ class CADLoss(nn.Module):
         B, S, N_ARGS, N_CLASS = logits.shape
         device = logits.device
 
+        # 转换为 float32 以提高数值稳定性
+        logits = logits.float()
+
         # 获取每个命令对应的参数掩码
         cmd_mask = self.cmd_args_mask[commands.long()]  # [B, S, n_args]#type: ignore
 
         # 组合掩码: 有效位置 AND 该命令使用该参数
         combined_mask = valid_mask.unsqueeze(-1) * cmd_mask  # [B, S, n_args]
 
+        if combined_mask.sum() < 1:
+            return torch.tensor(0.0, device=device)
+
         # 目标值偏移 (+1 因为-1变成0作为padding类)
         targets_shifted = (targets + 1).clamp(0, N_CLASS - 1)  # [B, S, n_args]
 
+        # 使用 log_softmax 提高数值稳定性
+        log_probs = F.log_softmax(logits, dim=-1)  # [B, S, n_args, N_CLASS]
+
         # Gumbel soft label
-        pred_probs = F.softmax(logits, dim=-1)  # [B, S, n_args, N_CLASS]
-        dtype = pred_probs.dtype  # 保持与 logits 相同的数据类型
-        target_dist = torch.zeros_like(pred_probs)
+        target_dist = torch.zeros(B, S, N_ARGS, N_CLASS, dtype=torch.float32, device=device)
 
         for shift in range(-tolerance, tolerance + 1):
             shifted_target = (targets_shifted + shift).clamp(0, N_CLASS - 1)
-            weight = torch.exp(torch.tensor(-alpha * abs(shift), dtype=dtype, device=device))
-            src = weight * torch.ones(B, S, N_ARGS, 1, dtype=dtype, device=device)
+            weight = torch.exp(torch.tensor(-alpha * abs(shift), dtype=torch.float32, device=device))
+            src = weight * torch.ones(B, S, N_ARGS, 1, dtype=torch.float32, device=device)
             target_dist.scatter_add_(
                 3,
                 shifted_target.unsqueeze(-1).long(),
@@ -168,8 +182,12 @@ class CADLoss(nn.Module):
         # 归一化
         target_dist = target_dist / (target_dist.sum(dim=-1, keepdim=True) + 1e-8)
 
-        # KL散度损失
-        loss_per_pos = -torch.sum(target_dist * torch.log(pred_probs + 1e-9), dim=-1)  # [B, S, n_args]
+        # 交叉熵损失 (使用 log_probs 而非 log(softmax))
+        loss_per_pos = -torch.sum(target_dist * log_probs, dim=-1)  # [B, S, n_args]
+
+        # 检查 NaN 并替换
+        loss_per_pos = torch.where(torch.isnan(loss_per_pos), torch.zeros_like(loss_per_pos), loss_per_pos)
+
         loss = (loss_per_pos * combined_mask).sum() / (combined_mask.sum() + 1e-8)
 
         return loss
@@ -198,26 +216,33 @@ class CADLoss(nn.Module):
 
         B, S, C = logits.shape
         device = logits.device
-        dtype = logits.dtype
+
+        # 转换为 float32 以提高数值稳定性
+        logits = logits.float()
 
         if use_soft_label:
-            # Gumbel 软标签损失
-            pred_probs = F.softmax(logits, dim=-1)  # [B, S, C]
-            target_dist = torch.zeros_like(pred_probs)
+            # 使用 log_softmax 提高数值稳定性
+            log_probs = F.log_softmax(logits, dim=-1)  # [B, S, C]
 
+            # Gumbel 软标签
+            target_dist = torch.zeros(B, S, C, dtype=torch.float32, device=device)
             targets_clamped = targets.long().clamp(0, C - 1)
 
             for shift in range(-tolerance, tolerance + 1):
                 shifted_target = (targets_clamped + shift).clamp(0, C - 1)
-                weight = torch.exp(torch.tensor(-alpha * abs(shift), dtype=dtype, device=device))
-                src = weight * torch.ones(B, S, 1, dtype=dtype, device=device)
+                weight = torch.exp(torch.tensor(-alpha * abs(shift), dtype=torch.float32, device=device))
+                src = weight * torch.ones(B, S, 1, dtype=torch.float32, device=device)
                 target_dist.scatter_add_(2, shifted_target.unsqueeze(-1), src)
 
             # 归一化
             target_dist = target_dist / (target_dist.sum(dim=-1, keepdim=True) + 1e-8)
 
-            # KL散度损失
-            loss_per_pos = -torch.sum(target_dist * torch.log(pred_probs + 1e-9), dim=-1)  # [B, S]
+            # 交叉熵损失
+            loss_per_pos = -torch.sum(target_dist * log_probs, dim=-1)  # [B, S]
+
+            # 检查 NaN 并替换
+            loss_per_pos = torch.where(torch.isnan(loss_per_pos), torch.zeros_like(loss_per_pos), loss_per_pos)
+
             loss = (loss_per_pos * combined_mask).sum() / (combined_mask.sum() + 1e-8)
         else:
             # 硬标签交叉熵
@@ -226,6 +251,7 @@ class CADLoss(nn.Module):
             mask_flat = combined_mask.reshape(-1)
 
             loss = F.cross_entropy(logits_flat, targets_flat, reduction='none')
+            loss = torch.where(torch.isnan(loss), torch.zeros_like(loss), loss)
             loss = (loss * mask_flat).sum() / (mask_flat.sum() + 1e-8)
 
         return loss
