@@ -49,6 +49,7 @@ class TrainConfig:
     # 数据集
     sample_limit: Optional[int] = None  # None 表示使用全部数据
     val_split: float = 0.1
+    test_split: float = 0.1  # 测试集比例
     num_workers: int = 4
     category_start: int = 0  # 起始类别 (0000)
     category_end: Optional[int] = None  # 结束类别 (None表示全部)
@@ -99,6 +100,8 @@ def parse_args():
     parser.add_argument("--sample_limit", type=int, default=None,
                         help="限制样本数量 (用于测试)")
     parser.add_argument("--val_split", type=float, default=0.1)
+    parser.add_argument("--test_split", type=float, default=0.1,
+                        help="测试集比例 (用于最终评估)")
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--category_start", type=int, default=0,
                         help="起始类别编号 (默认0，即0000)")
@@ -146,6 +149,7 @@ def main():
         grad_clip=args.grad_clip,
         sample_limit=args.sample_limit,
         val_split=args.val_split,
+        test_split=args.test_split,
         num_workers=args.num_workers,
         category_start=args.category_start,
         category_end=args.category_end,
@@ -190,17 +194,20 @@ def main():
         text_only=cfg.text_only
     )
 
-    # 划分训练/验证集
-    val_size = int(len(full_dataset) * cfg.val_split)
-    train_size = len(full_dataset) - val_size
+    # 划分训练/验证/测试集 (三集划分)
+    total_size = len(full_dataset)
+    test_size = int(total_size * cfg.test_split)
+    val_size = int(total_size * cfg.val_split)
+    train_size = total_size - val_size - test_size
 
-    train_dataset, val_dataset = random_split(
-        full_dataset, [train_size, val_size],
+    train_dataset, val_dataset, test_dataset = random_split(
+        full_dataset, [train_size, val_size, test_size],
         generator=torch.Generator().manual_seed(cfg.seed)
     )
 
-    print(f"训练集: {len(train_dataset)} 样本")
-    print(f"验证集: {len(val_dataset)} 样本")
+    print(f"训练集: {len(train_dataset)} 样本 ({100*train_size/total_size:.1f}%)")
+    print(f"验证集: {len(val_dataset)} 样本 ({100*val_size/total_size:.1f}%)")
+    print(f"测试集: {len(test_dataset)} 样本 ({100*test_size/total_size:.1f}%)")
 
     # 创建 DataLoader
     train_loader = DataLoader(
@@ -214,6 +221,14 @@ def main():
 
     val_loader = DataLoader(
         val_dataset,
+        batch_size=cfg.batch_size,
+        shuffle=False,
+        num_workers=cfg.num_workers,
+        pin_memory=True
+    )
+
+    test_loader = DataLoader(
+        test_dataset,
         batch_size=cfg.batch_size,
         shuffle=False,
         num_workers=cfg.num_workers,
@@ -265,8 +280,30 @@ def main():
     print("\n[4/4] 保存最终模型...")
     trainer.save_ckpt("final")
 
-    print("\n训练完成!")
+    # 5. 在测试集上进行最终评估
+    print("\n" + "=" * 60)
+    print("最终测试集评估")
+    print("=" * 60)
+
+    # 加载最佳模型进行测试
+    print("加载最佳模型进行测试...")
+    trainer.load_ckpt("best")
+
+    test_loss, test_metrics = trainer.validate(test_loader)
+    print(f"\n测试集结果:")
+    print(f"  损失: {test_loss:.4f}")
+    print(f"  命令准确率: {test_metrics['cmd_accuracy']*100:.2f}%")
+
+    # 完整评估 (可选)
+    if len(test_dataset) > 0:
+        eval_metrics = trainer.evaluate(test_loader, max_samples=min(500, len(test_dataset)))
+        print(f"  参数MAE: {eval_metrics['args_mae']:.4f}")
+
+    print("\n" + "=" * 60)
+    print("训练完成!")
+    print("=" * 60)
     print(f"最佳验证损失: {best_val_loss:.4f}")
+    print(f"测试集命令准确率: {test_metrics['cmd_accuracy']*100:.2f}%")
     print(f"模型保存于: {cfg.model_dir}")
 
 
