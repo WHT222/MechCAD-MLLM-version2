@@ -67,6 +67,9 @@ class TrainConfig:
     # 恢复训练
     resume: Optional[str] = None  # 检查点路径
 
+    # 训练模式
+    text_only: bool = False  # 第一阶段：仅使用文本模态
+
 
 def parse_args():
     """解析命令行参数"""
@@ -118,6 +121,10 @@ def parse_args():
     parser.add_argument("--resume", type=str, default=None,
                         help="从检查点恢复训练")
 
+    # 训练模式
+    parser.add_argument("--text_only", action="store_true",
+                        help="第一阶段：仅使用文本模态训练（跳过图像加载）")
+
     return parser.parse_args()
 
 
@@ -147,12 +154,14 @@ def main():
         full_eval_every=args.full_eval_every,
         val_frequency=args.val_frequency,
         seed=args.seed,
-        resume=args.resume
+        resume=args.resume,
+        text_only=args.text_only
     )
 
     print("=" * 60)
     print("MechCAD-MLLM 训练")
     print("=" * 60)
+    print(f"训练模式: {'纯文本 (第一阶段)' if cfg.text_only else '多模态 (图像+文本)'}")
     print(f"数据目录: {cfg.cad_vec_dir}")
     print(f"批次大小: {cfg.batch_size}")
     print(f"学习率: {cfg.lr}")
@@ -177,7 +186,8 @@ def main():
         image_dir=cfg.image_dir,
         sample_limit=cfg.sample_limit,
         category_start=cfg.category_start,
-        category_end=cfg.category_end
+        category_end=cfg.category_end,
+        text_only=cfg.text_only
     )
 
     # 划分训练/验证集

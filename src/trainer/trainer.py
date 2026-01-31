@@ -42,12 +42,14 @@ class MechCADTrainer(BaseTrainer):
                 - warmup_step: 预热步数
                 - grad_clip: 梯度裁剪阈值
                 - llava_model_name: LLaVA模型路径
+                - text_only: 是否仅使用文本模态（第一阶段训练）
         """
         self.cfg = cfg
         self.log_dir = cfg.log_dir
         self.model_dir = cfg.model_dir
         self.clock = TrainClock()
         self.batch_size = cfg.batch_size
+        self.text_only = getattr(cfg, 'text_only', False)
 
         # 确保目录存在
         os.makedirs(self.log_dir, exist_ok=True)
@@ -125,7 +127,7 @@ class MechCADTrainer(BaseTrainer):
             outputs: 模型输出字典
             loss_dict: 损失字典
         """
-        outputs = self.net(data)
+        outputs = self.net(data, text_only=self.text_only)
 
         # 将损失函数移到正确设备
         device = outputs['command_logits'].device

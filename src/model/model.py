@@ -203,31 +203,38 @@ class MechCADModel(nn.Module):
         img_np = np.clip(img_np, 0, 255).astype(np.uint8)
         return img_np
 
-    def forward(self, batch: Dict[str, Any]) -> Dict[str, torch.Tensor]:
+    def forward(self, batch: Dict[str, Any], text_only: bool = False) -> Dict[str, torch.Tensor]:
         """
         处理来自 OmniCADDataset 的一个批次。
 
         Args:
             batch: 包含 'images', 'text_caption', 'cad_sequence' 的字典
+            text_only: 是否仅使用文本模态（第一阶段训练）
 
         Returns:
             包含 'command_logits', 'args_logits', 'angle_logits', 'pos_logits' 的字典
         """
-        images_tensor = batch['images']  # (B, 8, C, H, W)
         texts = batch['text_caption']    # 字符串列表
-        batch_size = images_tensor.size(0)
 
-        # --- 为 LLaVA 准备输入 ---
-        # 使用第一个视图，反归一化后转为 PIL 图像
-        pil_images = []
-        for i in range(batch_size):
-            img_np = self._denormalize_image(images_tensor[i, 0])
-            pil_images.append(Image.fromarray(img_np))
+        if text_only:
+            # --- 纯文本模式：不使用图像 ---
+            prompts = [f"USER: {caption}\nGenerate the CAD command sequence. ASSISTANT:"
+                       for caption in texts]
+            inputs = self.processor(text=prompts, return_tensors="pt", padding=True)
+        else:
+            # --- 多模态模式：使用图像+文本 ---
+            images_tensor = batch['images']  # (B, 8, C, H, W)
+            batch_size = images_tensor.size(0)
 
-        # 创建 LLaVA 风格的提示
-        prompts = [f"USER: <image>\n{caption} ASSISTANT:" for caption in texts]
+            # 使用第一个视图，反归一化后转为 PIL 图像
+            pil_images = []
+            for i in range(batch_size):
+                img_np = self._denormalize_image(images_tensor[i, 0])
+                pil_images.append(Image.fromarray(img_np))
 
-        inputs = self.processor(text=prompts, images=pil_images, return_tensors="pt", padding=True)
+            # 创建 LLaVA 风格的提示
+            prompts = [f"USER: <image>\n{caption} ASSISTANT:" for caption in texts]
+            inputs = self.processor(text=prompts, images=pil_images, return_tensors="pt", padding=True)
 
         # 将输入移到与模型相同的设备上
         for k, v in inputs.items():

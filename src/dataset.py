@@ -22,7 +22,7 @@ class OmniCADDataset(Dataset):
     为 Omni-CAD 设计的多模态数据集，能够加载 CAD 向量序列、文本描述和8个视图的图像。
     """
     def __init__(self, cad_vec_dir, text_dir, image_dir, split='all', sample_limit=None,
-                 category_start=0, category_end=None):
+                 category_start=0, category_end=None, text_only=False):
         """
         初始化 Omni-CAD 数据集。
 
@@ -34,6 +34,7 @@ class OmniCADDataset(Dataset):
             sample_limit (int, optional): 限制加载的样本数量，用于快速测试。
             category_start (int): 起始类别编号 (默认0，即'0000').
             category_end (int, optional): 结束类别编号 (包含)。None表示加载所有可用类别。
+            text_only (bool): 仅使用文本模态，跳过图像加载（第一阶段训练）。
         """
         self.cad_vec_dir = cad_vec_dir
         self.text_dir = text_dir
@@ -42,6 +43,7 @@ class OmniCADDataset(Dataset):
         self.sample_limit = sample_limit
         self.category_start = category_start
         self.category_end = category_end
+        self.text_only = text_only
         self.num_views = 8
 
         self.samples = []
@@ -196,27 +198,31 @@ class OmniCADDataset(Dataset):
         # 2. 加载文本描述
         text_caption = self.text_captions.get(sample_id, "No description available.")
 
-        # 3. 加载8个视图的图像
-        # 图像路径格式: step_img/{category}/{filename}_{view:03d}.png
-        image_tensors = []
-        for i in range(self.num_views):
-            img_path = os.path.join(self.image_dir, category, f"{filename}_{i:03d}.png")
-            try:
-                if os.path.exists(img_path):
-                    image = Image.open(img_path).convert('RGB')
-                    image_tensors.append(self.image_transform(image))
-                else:
-                    # 如果某个视图不存在，用黑色图片填充
+        # 3. 加载8个视图的图像（text_only模式下跳过）
+        if self.text_only:
+            # 纯文本模式：返回占位tensor，不实际加载图像
+            images_stacked = torch.zeros(self.num_views, 3, 224, 224)
+        else:
+            # 图像路径格式: step_img/{category}/{filename}_{view:03d}.png
+            image_tensors = []
+            for i in range(self.num_views):
+                img_path = os.path.join(self.image_dir, category, f"{filename}_{i:03d}.png")
+                try:
+                    if os.path.exists(img_path):
+                        image = Image.open(img_path).convert('RGB')
+                        image_tensors.append(self.image_transform(image))
+                    else:
+                        # 如果某个视图不存在，用黑色图片填充
+                        image_tensors.append(torch.zeros(3, 224, 224))
+                except Exception as e:
+                    print(f"警告: 无法加载或处理图片 {img_path}: {e}")
                     image_tensors.append(torch.zeros(3, 224, 224))
-            except Exception as e:
-                print(f"警告: 无法加载或处理图片 {img_path}: {e}")
-                image_tensors.append(torch.zeros(3, 224, 224))
-        
-        # 如果一张图片都加载失败，则返回8个黑色图片
-        if not image_tensors:
-             image_tensors = [torch.zeros(3, 224, 224) for _ in range(self.num_views)]
-             
-        images_stacked = torch.stack(image_tensors) # 堆叠成 (8, C, H, W)
+
+            # 如果一张图片都加载失败，则返回8个黑色图片
+            if not image_tensors:
+                 image_tensors = [torch.zeros(3, 224, 224) for _ in range(self.num_views)]
+
+            images_stacked = torch.stack(image_tensors) # 堆叠成 (8, C, H, W)
 
         return {
             'id': sample_id,
