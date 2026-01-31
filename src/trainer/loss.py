@@ -37,10 +37,18 @@ class CADLoss(nn.Module):
             'pos_token': 2.0
         }
 
-        # 命令-参数掩码: 指示每种命令使用哪些参数
-        # 只取前 n_args 个参数 (13维向量: 1命令 + 12参数)
-        mask = torch.tensor(CMD_ARGS_MASK, dtype=torch.float32)[:, :self.n_args]
-        self.register_buffer("cmd_args_mask", mask)
+        # 适配13D向量的命令-参数掩码 (12个参数)
+        # 参数索引: [0:5]=草图参数, [5]=角度token, [6]=位置token, [7:12]=拉伸参数
+        cmd_args_mask_13d = np.array([
+            [1, 1, 0, 0, 0,  0, 0,  0, 0, 0, 0, 0],  # Line: x, y
+            [1, 1, 1, 1, 0,  0, 0,  0, 0, 0, 0, 0],  # Arc: x, y, alpha, f
+            [1, 1, 0, 0, 1,  0, 0,  0, 0, 0, 0, 0],  # Circle: x, y, r
+            [0, 0, 0, 0, 0,  0, 0,  0, 0, 0, 0, 0],  # EOS: 无参数
+            [0, 0, 0, 0, 0,  0, 0,  0, 0, 0, 0, 0],  # SOL: 无参数
+            [0, 0, 0, 0, 0,  1, 1,  1, 1, 1, 1, 1],  # Ext: angle, pos, e1, e2, b, u, s
+        ], dtype=np.float32)
+
+        self.register_buffer("cmd_args_mask", torch.tensor(cmd_args_mask_13d))
 
     def forward(self, outputs, batch):
         """

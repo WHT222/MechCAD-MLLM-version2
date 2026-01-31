@@ -15,6 +15,7 @@ from src.model.model import MechCADModel, MechCADConfig
 from src.trainer.loss import CADLoss
 from src.trainer.scheduler import GradualWarmupScheduler
 from src.trainer.base import BaseTrainer, TrainClock
+from src.utils.chamfer_distance import ChamferDistanceEvaluator
 from cadlib.macro import *
 
 
@@ -363,7 +364,30 @@ class MechCADTrainer(BaseTrainer):
             'num_samples': sample_count
         }
 
-        print(f"\n[Evaluate] 命令准确率: {cmd_accuracy:.4f}, 参数MAE: {args_mae:.4f}")
+        # 计算 Chamfer Distance (几何相似度)
+        print("\n计算 Chamfer Distance...")
+        try:
+            cd_evaluator = ChamferDistanceEvaluator(n_points=2048, normalize=True)
+            # 合并所有预测和真实向量
+            all_pred = np.concatenate(all_pred_vecs, axis=0)
+            all_gt = np.concatenate(all_gt_vecs, axis=0)
+
+            cd_metrics = cd_evaluator.evaluate(
+                [all_pred[i] for i in range(min(100, len(all_pred)))],  # 限制数量避免太慢
+                [all_gt[i] for i in range(min(100, len(all_gt)))]
+            )
+
+            metrics['chamfer_distance'] = cd_metrics['chamfer_distance']
+            metrics['chamfer_valid_count'] = cd_metrics['valid_count']
+            metrics['chamfer_failed_count'] = cd_metrics['failed_count']
+
+            print(f"[Chamfer Distance] CD: {cd_metrics['chamfer_distance']:.6f}, "
+                  f"有效: {cd_metrics['valid_count']}, 失败: {cd_metrics['failed_count']}")
+        except Exception as e:
+            print(f"Chamfer Distance 计算失败: {e}")
+            metrics['chamfer_distance'] = -1.0
+
+        print(f"\n[Evaluate] 命令准确率: {cmd_accuracy*100:.2f}%, 参数MAE: {args_mae:.4f}")
 
         # 记录到 TensorBoard
         if self.use_tensorboard:
@@ -405,8 +429,16 @@ class MechCADTrainer(BaseTrainer):
 
         if refill_pad:
             # 根据命令类型填充未使用的参数为 -1
-            cmd_args_mask = torch.tensor(CMD_ARGS_MASK, device=pred_commands.device)
-            mask = cmd_args_mask[pred_commands.long()]  # [B, S, 12]
+            # 适配13D向量的命令-参数掩码 (12个参数)
+            cmd_args_mask_13d = torch.tensor([
+                [1, 1, 0, 0, 0,  0, 0,  0, 0, 0, 0, 0],  # Line: x, y
+                [1, 1, 1, 1, 0,  0, 0,  0, 0, 0, 0, 0],  # Arc: x, y, alpha, f
+                [1, 1, 0, 0, 1,  0, 0,  0, 0, 0, 0, 0],  # Circle: x, y, r
+                [0, 0, 0, 0, 0,  0, 0,  0, 0, 0, 0, 0],  # EOS: 无参数
+                [0, 0, 0, 0, 0,  0, 0,  0, 0, 0, 0, 0],  # SOL: 无参数
+                [0, 0, 0, 0, 0,  1, 1,  1, 1, 1, 1, 1],  # Ext: angle, pos, e1-e2-b-u-s
+            ], dtype=torch.float32, device=pred_commands.device)
+            mask = cmd_args_mask_13d[pred_commands.long()]  # [B, S, 12]
             pred_args = torch.where(mask.bool(), pred_args, torch.tensor(-1, device=pred_args.device))
 
         # 组合为 13 维向量
@@ -457,7 +489,8 @@ class MechCADTrainer(BaseTrainer):
             raise FileNotFoundError(f"检查点不存在: {load_path}")
 
         print(f"从 {load_path} 加载检查点...")
-        checkpoint = torch.load(load_path, map_location='cpu')
+        # weights_only=False 用于加载包含自定义类 (MechCADConfig) 的检查点
+        checkpoint = torch.load(load_path, map_location='cpu', weights_only=False)
 
         self.net.llm2cad_decoder.load_state_dict(checkpoint['decoder_state_dict'])
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
