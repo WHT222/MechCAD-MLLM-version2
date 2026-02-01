@@ -147,7 +147,15 @@ class LLM2CADDecoder(nn.Module):
     def __init__(self, cfg: MechCADConfig):
         super().__init__()
         self.d_model = cfg.d_model
-        self.adapter = nn.Linear(cfg.llm_hidden_dim, self.d_model)
+        # 使用多层 adapter 并添加归一化，防止梯度爆炸
+        self.adapter = nn.Sequential(
+            nn.Linear(cfg.llm_hidden_dim, cfg.d_model * 2),
+            nn.LayerNorm(cfg.d_model * 2),
+            nn.GELU(),
+            nn.Dropout(cfg.dropout),
+            nn.Linear(cfg.d_model * 2, cfg.d_model),
+            nn.LayerNorm(cfg.d_model),
+        )
         self.command_decoder = CommandDecoder(cfg)
         self.args_decoder = ArgsDecoder(cfg)
 
