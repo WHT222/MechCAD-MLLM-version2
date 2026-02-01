@@ -501,4 +501,10 @@ class MechCADTrainer(BaseTrainer):
         device = next(self.net.llava_model.parameters()).device
         self.net.llm2cad_decoder.to(device)
 
+        # 将优化器状态也移到 GPU
+        for state in self.optimizer.state.values():
+            for k, v in state.items():
+                if isinstance(v, torch.Tensor):
+                    state[k] = v.to(device)
+
         print(f"检查点加载完成，恢复到 epoch {self.clock.epoch}")
