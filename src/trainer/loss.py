@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import numpy as np
 
 import sys
 import os
@@ -9,6 +10,7 @@ if project_root not in sys.path:
     sys.path.append(project_root)
 
 from cadlib.macro import *
+from src.unified_vocab.vocab import VOCAB_SIZE, MAX_ARGS_PER_CMD
 
 
 class CADLoss(nn.Module):
@@ -200,6 +202,7 @@ class CADLoss(nn.Module):
 
         return loss
 
+#弃用
     def _compute_token_loss(self, logits, targets, commands, valid_mask, cmd_type,
                              use_soft_label=True, tolerance=2, alpha=2.0):
         """
@@ -261,5 +264,156 @@ class CADLoss(nn.Module):
             loss = F.cross_entropy(logits_flat, targets_flat, reduction='none')
             loss = torch.where(torch.isnan(loss), torch.zeros_like(loss), loss)
             loss = (loss * mask_flat).sum() / (mask_flat.sum() + 1e-8)
+
+        return loss
+
+
+class UnifiedCADLoss(nn.Module):
+    """
+    统一词表损失函数
+
+    简洁设计：
+    - loss_cmd: 命令分类损失 (交叉熵)
+    - loss_args: 统一大词表参数损失 (Gumbel软标签)
+
+    双解码器结构保持不变，参数预测改为大词汇表分类。
+    """
+
+    def __init__(self, cfg, weights=None, tolerance=3, alpha=2.0):
+        super().__init__()
+        self.cfg = cfg
+        self.n_commands = cfg.cad_n_commands
+        self.vocab_size = VOCAB_SIZE
+        self.max_args = MAX_ARGS_PER_CMD
+
+        # 损失权重
+        self.weights = weights or {
+            'cmd': 1.0,
+            'args': 1.0,
+        }
+
+        # Gumbel软标签参数
+        self.tolerance = tolerance
+        self.alpha = alpha
+
+        # 构建参数位置掩码: 哪些位置对哪些命令有效
+        # [n_commands, MAX_ARGS_PER_CMD]
+        from src.unified_vocab.vocab import CMD_ARG_COUNTS
+        args_mask = np.zeros((self.n_commands, MAX_ARGS_PER_CMD), dtype=np.float32)
+        for cmd_idx, n_args in CMD_ARG_COUNTS.items():
+            if cmd_idx < self.n_commands:
+                # 有效参数位置 (含边界Token和SEP)
+                args_mask[cmd_idx, :n_args + 1] = 1.0
+        self.register_buffer("args_mask", torch.tensor(args_mask))
+
+    def forward(self, outputs, batch):
+        """
+        计算损失
+
+        Args:
+            outputs: 模型输出
+                - command_logits: [B, S, n_commands]
+                - unified_args_logits: [B, S, MAX_ARGS_PER_CMD, VOCAB_SIZE]
+            batch: 数据批次
+                - commands: [B, S] 命令目标
+                - args_tokens: [B, S, MAX_ARGS_PER_CMD] 参数token目标
+        """
+        device = outputs['command_logits'].device
+
+        tgt_commands = batch['commands'].to(device)
+        tgt_args = batch['args_tokens'].to(device)
+
+        # 有效位置掩码
+        valid_mask = self._get_valid_mask(tgt_commands)
+
+        # 1. 命令损失 (交叉熵)
+        loss_cmd = self._compute_cmd_loss(
+            outputs['command_logits'], tgt_commands, valid_mask
+        )
+
+        # 2. 参数损失 (Gumbel软标签)
+        loss_args = self._compute_args_loss(
+            outputs['unified_args_logits'], tgt_args, tgt_commands, valid_mask
+        )
+
+        # 总损失
+        total_loss = (
+            self.weights['cmd'] * loss_cmd +
+            self.weights['args'] * loss_args
+        )
+
+        return {
+            'loss': total_loss,
+            'loss_cmd': loss_cmd,
+            'loss_args': loss_args,
+        }
+
+    def _get_valid_mask(self, commands):
+        """获取有效序列位置的掩码"""
+        eos_cumsum = (commands == EOS_IDX).cumsum(dim=-1)
+        valid_mask = (eos_cumsum <= 1).float()
+        return valid_mask
+
+    def _compute_cmd_loss(self, logits, targets, valid_mask):
+        """计算命令分类损失 (交叉熵)"""
+        B, S, C = logits.shape
+        logits = logits.float()
+
+        logits_flat = logits.reshape(-1, C)
+        targets_flat = targets.reshape(-1).long()
+        mask_flat = valid_mask.reshape(-1)
+
+        loss = F.cross_entropy(logits_flat, targets_flat, reduction='none')
+        loss = torch.where(torch.isnan(loss), torch.zeros_like(loss), loss)
+        loss = (loss * mask_flat).sum() / (mask_flat.sum() + 1e-8)
+
+        return loss
+
+    def _compute_args_loss(self, logits, targets, commands, valid_mask):
+        """
+        计算统一大词表参数损失 (Gumbel软标签)
+
+        Args:
+            logits: [B, S, MAX_ARGS_PER_CMD, VOCAB_SIZE]
+            targets: [B, S, MAX_ARGS_PER_CMD]
+            commands: [B, S]
+            valid_mask: [B, S]
+        """
+        B, S, N_ARGS, V = logits.shape
+        device = logits.device
+        logits = logits.float()
+
+        # 获取每个命令对应的参数位置掩码
+        cmd_mask = self.args_mask[commands.long()]  # [B, S, MAX_ARGS_PER_CMD]
+
+        # 组合掩码
+        combined_mask = valid_mask.unsqueeze(-1) * cmd_mask  # [B, S, MAX_ARGS_PER_CMD]
+
+        if combined_mask.sum() < 1:
+            return torch.tensor(0.0, device=device)
+
+        # log_softmax 提高数值稳定性
+        log_probs = F.log_softmax(logits, dim=-1)  # [B, S, N_ARGS, V]
+
+        # 目标值
+        targets_clamped = targets.long().clamp(0, V - 1)
+
+        # 构建Gumbel软标签分布
+        target_dist = torch.zeros(B, S, N_ARGS, V, dtype=torch.float32, device=device)
+
+        for shift in range(-self.tolerance, self.tolerance + 1):
+            shifted_target = (targets_clamped + shift).clamp(0, V - 1)
+            weight = torch.exp(torch.tensor(-self.alpha * abs(shift), dtype=torch.float32, device=device))
+            src = weight * torch.ones(B, S, N_ARGS, 1, dtype=torch.float32, device=device)
+            target_dist.scatter_add_(3, shifted_target.unsqueeze(-1), src)
+
+        # 归一化
+        target_dist = target_dist / (target_dist.sum(dim=-1, keepdim=True) + 1e-8)
+
+        # 交叉熵损失
+        loss_per_pos = -torch.sum(target_dist * log_probs, dim=-1)  # [B, S, N_ARGS]
+        loss_per_pos = torch.where(torch.isnan(loss_per_pos), torch.zeros_like(loss_per_pos), loss_per_pos)
+
+        loss = (loss_per_pos * combined_mask).sum() / (combined_mask.sum() + 1e-8)
 
         return loss

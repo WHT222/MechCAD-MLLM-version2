@@ -16,6 +16,7 @@ if project_root not in sys.path:
 from src.model.layers.transformer import TransformerDecoder, TransformerDecoderLayer, LayerNorm
 from src.model.layers.positional_encoding import PositionalEncodingLUT
 from cadlib.macro import *
+from src.unified_vocab.vocab import VOCAB_SIZE, MAX_ARGS_PER_CMD
 
 
 @dataclass
@@ -109,36 +110,37 @@ class CommandDecoder(nn.Module):
         return command_logits, out
 
 class ArgsDecoder(nn.Module):
-    """从 LLM 特征解码参数序列，由命令解码器引导。"""
+    """从 LLM 特征解码参数序列，使用统一大词表。"""
     def __init__(self, cfg: MechCADConfig):
         super().__init__()
         self.embedding = ConstEmbedding(cfg)
         decoder_layer = TransformerDecoderLayer(cfg.d_model, cfg.n_heads, cfg.dim_feedforward, cfg.dropout)
         self.decoder = TransformerDecoder(decoder_layer, cfg.n_layers_decode, LayerNorm(cfg.d_model))
-        
-        self.fcn = ArgsFCN(cfg)
 
-        # 在 13D 向量中，Extrude 命令从索引 6 开始有 7 个参数。
-        # 这意味着我们稠密的 12 元素参数向量中的参数在索引 5-11。
-        # 角度标记是第 6 个参数（索引 5），位置标记是第 7 个参数（索引 6）。
-        self.angle_token_idx = 5
-        self.pos_token_idx = 6
+        self.n_args = MAX_ARGS_PER_CMD
+        self.vocab_size = VOCAB_SIZE
 
-        self.angle_head = nn.Linear(cfg.args_dim, cfg.n_angle_tokens)
-        self.pos_head = nn.Linear(cfg.args_dim, cfg.n_pos_tokens)
+        # 统一大词表输出头
+        self.output_head = nn.Sequential(
+            nn.Linear(cfg.d_model, cfg.d_model * 2),
+            nn.LayerNorm(cfg.d_model * 2),
+            nn.GELU(),
+            nn.Dropout(cfg.dropout),
+            nn.Linear(cfg.d_model * 2, self.n_args * self.vocab_size)
+        )
 
     def forward(self, z, guidance, memory_key_padding_mask=None):
         src = self.embedding(z)
         src = src + guidance  # 注入来自命令解码器的引导
         out = self.decoder(src, z, memory_key_padding_mask=memory_key_padding_mask)
+        # out: [S, N, d_model]
 
-        # args_features: [S, N, cad_n_args, args_dim]
-        args_features = self.fcn(out)
+        # 统一大词表输出
+        logits = self.output_head(out)  # [S, N, n_args * vocab_size]
+        S, N, _ = logits.shape
+        logits = logits.reshape(S, N, self.n_args, self.vocab_size)
 
-        angle_token_logits = self.angle_head(args_features[:, :, self.angle_token_idx, :])
-        pos_token_logits = self.pos_head(args_features[:, :, self.pos_token_idx, :])
-
-        return args_features, angle_token_logits, pos_token_logits
+        return logits
 
 # --- 顶级解码器 ---
 
@@ -170,15 +172,13 @@ class LLM2CADDecoder(nn.Module):
         z = z.permute(1, 0, 2)  # [LLM_Seq_Len, Batch, d_model]
 
         command_logits, guidance = self.command_decoder(z, memory_key_padding_mask)
-        args_features, angle_logits, pos_logits = self.args_decoder(z, guidance, memory_key_padding_mask)
+        unified_args_logits = self.args_decoder(z, guidance, memory_key_padding_mask)
 
         # 置换到 [Batch, Seq_Len, ...] 以进行损失计算
         command_logits = command_logits.permute(1, 0, 2)
-        args_features = args_features.permute(1, 0, 2, 3)
-        angle_logits = angle_logits.permute(1, 0, 2)
-        pos_logits = pos_logits.permute(1, 0, 2)
+        unified_args_logits = unified_args_logits.permute(1, 0, 2, 3)
 
-        return command_logits, args_features, angle_logits, pos_logits
+        return command_logits, unified_args_logits
 
 # --- 完整 MLLM 模型 ---
 
@@ -265,15 +265,13 @@ class MechCADModel(nn.Module):
         # 只移动到设备，不改变 dtype (保持 float32 以避免溢出)
         self.llm2cad_decoder.to(llm_features.device)
 
-        command_logits, args_features, angle_logits, pos_logits = self.llm2cad_decoder(
+        command_logits, unified_args_logits = self.llm2cad_decoder(
             llm_features, memory_key_padding_mask
         )
 
         return {
             'command_logits': command_logits,
-            'args_logits': args_features,
-            'angle_logits': angle_logits,
-            'pos_logits': pos_logits
+            'unified_args_logits': unified_args_logits,
         }
 
 # --- 示例用法 ---

@@ -16,6 +16,7 @@ if project_root not in sys.path:
     sys.path.append(project_root)
 
 from cadlib.macro import *
+from src.unified_vocab.converter import convert_13d_to_unified_tokens
 
 class OmniCADDataset(Dataset):
     """
@@ -224,9 +225,16 @@ class OmniCADDataset(Dataset):
 
             images_stacked = torch.stack(image_tensors) # 堆叠成 (8, C, H, W)
 
+        # 4. 转换为统一词表格式
+        commands, args_tokens = convert_13d_to_unified_tokens(padded_cad_vec)
+        commands_tensor = torch.from_numpy(commands).long()
+        args_tokens_tensor = torch.from_numpy(args_tokens).long()
+
         return {
             'id': sample_id,
             'cad_sequence': cad_tensor,
+            'commands': commands_tensor,
+            'args_tokens': args_tokens_tensor,
             'text_caption': text_caption,
             'images': images_stacked
         }

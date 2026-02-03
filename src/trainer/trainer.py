@@ -12,7 +12,7 @@ if project_root not in sys.path:
     sys.path.append(project_root)
 
 from src.model.model import MechCADModel, MechCADConfig
-from src.trainer.loss import CADLoss
+from src.trainer.loss import CADLoss, UnifiedCADLoss
 from src.trainer.scheduler import GradualWarmupScheduler
 from src.trainer.base import BaseTrainer, TrainClock
 from src.utils.chamfer_distance import ChamferDistanceEvaluator
@@ -101,7 +101,8 @@ class MechCADTrainer(BaseTrainer):
     def set_loss_function(self):
         """设置损失函数"""
         loss_weights = getattr(self.cfg, 'loss_weights', None)
-        self.loss_func = CADLoss(self.model_cfg, weights=loss_weights)
+        # 使用统一词表损失函数
+        self.loss_func = UnifiedCADLoss(self.model_cfg, weights=loss_weights)
 
     def set_optimizer(self, cfg):
         """设置优化器和学习率调度器"""
@@ -272,14 +273,11 @@ class MechCADTrainer(BaseTrainer):
     def _compute_cmd_accuracy(self, outputs, data):
         """计算命令预测准确率"""
         device = outputs['command_logits'].device
-        cad_seq = data['cad_sequence'].to(device)
-        tgt_commands = cad_seq[:, :, 0]
+        tgt_commands = data['commands'].to(device)
 
         pred_commands = outputs['command_logits'].argmax(dim=-1)
 
         # 有效掩码
-        valid_mask = (tgt_commands != EOS_IDX).float()
-        # 包含第一个 EOS
         eos_cumsum = (tgt_commands == EOS_IDX).cumsum(dim=-1)
         valid_mask = (eos_cumsum <= 1).float()
 
