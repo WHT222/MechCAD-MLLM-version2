@@ -139,37 +139,6 @@ class OmniCADDataset(Dataset):
     def __len__(self):
         return len(self.samples)
 
-    def _convert_17d_to_13d(self, vec_17d):
-        """
-        将单个17维CAD向量转换为13维格式。
-        """
-        vec_13d = np.full(13, PAD_VAL, dtype=np.int32)
-        command = int(vec_17d[0])
-        vec_13d[0] = command
-
-        if command in [LINE_IDX, ARC_IDX, CIRCLE_IDX]:
-            # 复制草图参数
-            vec_13d[1:6] = vec_17d[1:6]
-        elif command == EXT_IDX:
-            # 角度转换为Token
-            theta, phi, gamma = vec_17d[6], vec_17d[7], vec_17d[8]
-            i_theta = np.clip(np.floor((theta / np.pi) * 9), 0, 8)
-            i_phi = np.clip(np.floor(((phi + np.pi) / (2 * np.pi)) * 9), 0, 8)
-            i_gamma = np.clip(np.floor(((gamma + np.pi) / (2 * np.pi)) * 9), 0, 8)
-            vec_13d[6] = i_theta * 81 + i_phi * 9 + i_gamma
-
-            # 位置转换为Token
-            px, py, pz = vec_17d[9], vec_17d[10], vec_17d[11]
-            i_x = np.clip(np.floor(px * 36), 0, 35)
-            i_y = np.clip(np.floor(py * 36), 0, 35)
-            i_z = np.clip(np.floor(pz * 36), 0, 35)
-            vec_13d[7] = i_z * 1296 + i_y * 36 + i_x
-            
-            # 复制剩余的拉伸参数
-            vec_13d[8:13] = vec_17d[12:17]
-            
-        return vec_13d
-
     def __getitem__(self, idx):
         sample_info = self.samples[idx]
         sample_id = sample_info['id']  # e.g., '0000/00000007_00001'
@@ -177,23 +146,23 @@ class OmniCADDataset(Dataset):
         category = sample_info['category']  # e.g., '0000'
         filename = sample_info['filename']  # e.g., '00000007_00001'
 
-        # 1. 加载并转换CAD向量序列
+        # 1. 加载CAD向量序列 (直接使用17维向量)
         try:
             with h5py.File(h5_path, 'r') as fp:
-                cad_vec_17d = fp['vec'][:]  # type:ignore
-
-            # 将17维向量序列转换为13维
-            cad_vec_13d = np.array([self._convert_17d_to_13d(v) for v in cad_vec_17d], dtype=np.int32)  # type:ignore
+                cad_vec = fp['vec'][:]  # type:ignore  [S, 17]
 
             # 确保序列长度统一，进行填充
-            padded_cad_vec = np.full((MAX_TOTAL_LEN, 13), EOS_IDX, dtype=np.int32)
-            seq_len = min(len(cad_vec_13d), MAX_TOTAL_LEN)
-            padded_cad_vec[:seq_len] = cad_vec_13d[:seq_len]
+            # 填充值：命令为EOS_IDX，参数为PAD_VAL(-1)
+            padded_cad_vec = np.full((MAX_TOTAL_LEN, N_ARGS + 1), PAD_VAL, dtype=np.int32)
+            padded_cad_vec[:, 0] = EOS_IDX  # 命令列默认为EOS
+            seq_len = min(len(cad_vec), MAX_TOTAL_LEN)
+            padded_cad_vec[:seq_len] = cad_vec[:seq_len]
             cad_tensor = torch.from_numpy(padded_cad_vec).long()
         except Exception as e:
             print(f"警告: 无法加载或处理h5文件 {h5_path}: {e}")
             # 返回一个表示错误的空Tensor
-            cad_tensor = torch.full((MAX_TOTAL_LEN, 13), EOS_IDX, dtype=torch.long)
+            cad_tensor = torch.full((MAX_TOTAL_LEN, N_ARGS + 1), PAD_VAL, dtype=torch.long)
+            cad_tensor[:, 0] = EOS_IDX
 
         # 2. 加载文本描述
         text_caption = self.text_captions.get(sample_id, "No description available.")

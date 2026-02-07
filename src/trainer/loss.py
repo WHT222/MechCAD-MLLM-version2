@@ -13,42 +13,28 @@ from cadlib.macro import *
 
 class CADLoss(nn.Module):
     """
-    适配13维CAD向量的损失函数。
+    适配17维CAD向量的损失函数（统一257级词表）。
 
-    13维向量结构:
+    17维向量结构:
     - [0]: 命令类型 (Line, Arc, Circle, EOS, SOL, Ext)
     - [1:6]: 草图参数 (x, y, alpha, f, r)
-    - [6]: 角度Token (theta, phi, gamma 编码为单一token)
-    - [7]: 位置Token (px, py, pz 编码为单一token)
-    - [8:13]: 拉伸参数 (e1, e2, b, u, s)
+    - [6:17]: 拉伸参数 (theta, phi, gamma, p_x, p_y, p_z, s, e1, e2, b, u)
     """
     def __init__(self, cfg, weights=None):
         super().__init__()
         self.cfg = cfg
         self.n_commands = cfg.cad_n_commands
         self.n_args = cfg.cad_n_args
-        self.args_dim = cfg.args_dim
+        self.args_vocab_size = cfg.args_vocab_size
 
         # 损失权重
         self.weights = weights or {
             'cmd': 1.0,
             'args': 1.0,
-            'angle_token': 2.0,
-            'pos_token': 2.0
         }
 
-        # 适配13D向量的命令-参数掩码 (12个参数)
-        # 参数索引: [0:5]=草图参数, [5]=角度token, [6]=位置token, [7:12]=拉伸参数
-        cmd_args_mask_13d = np.array([
-            [1, 1, 0, 0, 0,  0, 0,  0, 0, 0, 0, 0],  # Line: x, y
-            [1, 1, 1, 1, 0,  0, 0,  0, 0, 0, 0, 0],  # Arc: x, y, alpha, f
-            [1, 1, 0, 0, 1,  0, 0,  0, 0, 0, 0, 0],  # Circle: x, y, r
-            [0, 0, 0, 0, 0,  0, 0,  0, 0, 0, 0, 0],  # EOS: 无参数
-            [0, 0, 0, 0, 0,  0, 0,  0, 0, 0, 0, 0],  # SOL: 无参数
-            [0, 0, 0, 0, 0,  1, 1,  1, 1, 1, 1, 1],  # Ext: angle, pos, e1, e2, b, u, s
-        ], dtype=np.float32)
-
-        self.register_buffer("cmd_args_mask", torch.tensor(cmd_args_mask_13d))
+        # 使用 cadlib/macro.py 中定义的命令-参数掩码 (16个参数)
+        self.register_buffer("cmd_args_mask", torch.tensor(CMD_ARGS_MASK, dtype=torch.float32))
 
     def forward(self, outputs, batch):
         """
@@ -57,18 +43,16 @@ class CADLoss(nn.Module):
         Args:
             outputs: 模型输出字典
                 - command_logits: [B, S, n_commands]
-                - args_logits: [B, S, n_args, args_dim]
-                - angle_logits: [B, S, n_angle_tokens]
-                - pos_logits: [B, S, n_pos_tokens]
+                - args_logits: [B, S, n_args, 257]
             batch: 数据批次
-                - cad_sequence: [B, S, 13]
+                - cad_sequence: [B, S, 17]
         """
         device = outputs['command_logits'].device
 
         # 目标序列
-        cad_seq = batch['cad_sequence'].to(device)  # [B, S, 13]
+        cad_seq = batch['cad_sequence'].to(device)  # [B, S, 17]
         tgt_commands = cad_seq[:, :, 0]  # [B, S]
-        tgt_args = cad_seq[:, :, 1:]  # [B, S, 12]
+        tgt_args = cad_seq[:, :, 1:]  # [B, S, 16]
 
         # 获取有效位置掩码 (非EOS填充位置)
         valid_mask = self._get_valid_mask(tgt_commands)  # [B, S]
@@ -76,41 +60,19 @@ class CADLoss(nn.Module):
         # 1. 命令损失
         loss_cmd = self._compute_cmd_loss(outputs['command_logits'], tgt_commands, valid_mask)
 
-        # 2. 参数损失 (使用 Gumbel soft label)
+        # 2. 参数损失 (使用 Gumbel soft label，统一257级词表)
         loss_args = self._compute_args_loss(outputs['args_logits'], tgt_args, tgt_commands, valid_mask)
-
-        # 3. 角度Token损失 (仅对Ext命令)
-        loss_angle = self._compute_token_loss(
-            outputs['angle_logits'],
-            tgt_args[:, :, 5],  # 角度token在第6个参数位置(索引5)
-            tgt_commands,
-            valid_mask,
-            cmd_type=EXT_IDX
-        )
-
-        # 4. 位置Token损失 (仅对Ext命令)
-        loss_pos = self._compute_token_loss(
-            outputs['pos_logits'],
-            tgt_args[:, :, 6],  # 位置token在第7个参数位置(索引6)
-            tgt_commands,
-            valid_mask,
-            cmd_type=EXT_IDX
-        )
 
         # 加权总损失
         total_loss = (
             self.weights['cmd'] * loss_cmd +
-            self.weights['args'] * loss_args +
-            self.weights['angle_token'] * loss_angle +
-            self.weights['pos_token'] * loss_pos
+            self.weights['args'] * loss_args
         )
 
         return {
             'loss': total_loss,
             'loss_cmd': loss_cmd,
             'loss_args': loss_args,
-            'loss_angle': loss_angle,
-            'loss_pos': loss_pos
         }
 
     def _get_valid_mask(self, commands):

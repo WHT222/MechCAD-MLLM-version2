@@ -31,27 +31,18 @@ class MechCADConfig:
     # CAD 序列属性
     cad_max_total_len: int = MAX_TOTAL_LEN  # 60
     cad_n_commands: int = len(ALL_COMMANDS)
-    cad_n_args: int = 12  # 基于 13D 向量（1 个命令 + 12 个参数）
+    cad_n_args: int = N_ARGS  # 16 个参数 (5 sketch + 11 extrude)
     
-    # 来自 vector_definition.md 的参数标记化设置
-    angle_bins: int = 9
-    pos_grid_size: int = 36
-    
-    @property
-    def n_angle_tokens(self) -> int:
-        return self.angle_bins ** 3
+    # 统一参数词表设置（0-255有效值，-1填充）
+    args_vocab_size: int = 257  # 256个有效值 + 1个填充
 
-    @property
-    def n_pos_tokens(self) -> int:
-        return self.pos_grid_size ** 3
-        
     # LLM/MLLM 设置
     llm_hidden_dim: int = 4096  # LLaVA-1.5-7B 隐层大小
-    args_dim: int = 256 # 连续参数回归的维度，不被令牌头使用
+    args_dim: int = 256 # 参数嵌入维度
 
 # --- 解码器子模块 ---
 
-class ConstEmbedding(nn.Module):
+class ConstEmbedding(nn.Module):    
     """用位置编码生成一个常数、可学习的序列。"""
     def __init__(self, cfg: MechCADConfig):
         super().__init__()
@@ -109,23 +100,17 @@ class CommandDecoder(nn.Module):
         return command_logits, out
 
 class ArgsDecoder(nn.Module):
-    """从 LLM 特征解码参数序列，由命令解码器引导。"""
+    """从 LLM 特征解码参数序列，由命令解码器引导。使用统一257级词表。"""
     def __init__(self, cfg: MechCADConfig):
         super().__init__()
         self.embedding = ConstEmbedding(cfg)
         decoder_layer = TransformerDecoderLayer(cfg.d_model, cfg.n_heads, cfg.dim_feedforward, cfg.dropout)
         self.decoder = TransformerDecoder(decoder_layer, cfg.n_layers_decode, LayerNorm(cfg.d_model))
-        
+
         self.fcn = ArgsFCN(cfg)
 
-        # 在 13D 向量中，Extrude 命令从索引 6 开始有 7 个参数。
-        # 这意味着我们稠密的 12 元素参数向量中的参数在索引 5-11。
-        # 角度标记是第 6 个参数（索引 5），位置标记是第 7 个参数（索引 6）。
-        self.angle_token_idx = 5
-        self.pos_token_idx = 6
-
-        self.angle_head = nn.Linear(cfg.args_dim, cfg.n_angle_tokens)
-        self.pos_head = nn.Linear(cfg.args_dim, cfg.n_pos_tokens)
+        # 统一参数token头：每个参数位置预测257类（0-255有效值，-1填充映射到ignore）
+        self.args_head = nn.Linear(cfg.args_dim, cfg.args_vocab_size)
 
     def forward(self, z, guidance, memory_key_padding_mask=None):
         src = self.embedding(z)
@@ -135,10 +120,10 @@ class ArgsDecoder(nn.Module):
         # args_features: [S, N, cad_n_args, args_dim]
         args_features = self.fcn(out)
 
-        angle_token_logits = self.angle_head(args_features[:, :, self.angle_token_idx, :])
-        pos_token_logits = self.pos_head(args_features[:, :, self.pos_token_idx, :])
+        # args_logits: [S, N, cad_n_args, args_vocab_size]
+        args_logits = self.args_head(args_features)
 
-        return args_features, angle_token_logits, pos_token_logits
+        return args_logits
 
 # --- 顶级解码器 ---
 
@@ -170,15 +155,13 @@ class LLM2CADDecoder(nn.Module):
         z = z.permute(1, 0, 2)  # [LLM_Seq_Len, Batch, d_model]
 
         command_logits, guidance = self.command_decoder(z, memory_key_padding_mask)
-        args_features, angle_logits, pos_logits = self.args_decoder(z, guidance, memory_key_padding_mask)
+        args_logits = self.args_decoder(z, guidance, memory_key_padding_mask)
 
         # 置换到 [Batch, Seq_Len, ...] 以进行损失计算
         command_logits = command_logits.permute(1, 0, 2)
-        args_features = args_features.permute(1, 0, 2, 3)
-        angle_logits = angle_logits.permute(1, 0, 2)
-        pos_logits = pos_logits.permute(1, 0, 2)
+        args_logits = args_logits.permute(1, 0, 2, 3)
 
-        return command_logits, args_features, angle_logits, pos_logits
+        return command_logits, args_logits
 
 # --- 完整 MLLM 模型 ---
 
@@ -265,15 +248,13 @@ class MechCADModel(nn.Module):
         # 只移动到设备，不改变 dtype (保持 float32 以避免溢出)
         self.llm2cad_decoder.to(llm_features.device)
 
-        command_logits, args_features, angle_logits, pos_logits = self.llm2cad_decoder(
+        command_logits, args_logits = self.llm2cad_decoder(
             llm_features, memory_key_padding_mask
         )
 
         return {
-            'command_logits': command_logits,
-            'args_logits': args_features,
-            'angle_logits': angle_logits,
-            'pos_logits': pos_logits
+            'command_logits': command_logits,  # [B, S, n_commands]
+            'args_logits': args_logits,        # [B, S, n_args, 257]
         }
 
 # --- 示例用法 ---
@@ -316,14 +297,12 @@ if __name__ == '__main__':
         # 5. 打印输出形状以验证
         print("\n--- 输出形状 ---")
         print(f"命令逻辑: {outputs['command_logits'].shape}")
-        print(f"参数特征:  {outputs['args_logits'].shape}")
-        print(f"角度逻辑:   {outputs['angle_logits'].shape}")
-        print(f"位置逻辑:  {outputs['pos_logits'].shape}")
-        
+        print(f"参数逻辑: {outputs['args_logits'].shape}")
+
         # 预期形状
         batch_size = len(real_batch['id'])
         print(f"\n预期命令逻辑形状: ({batch_size}, {config.cad_max_total_len}, {config.cad_n_commands})")
-        print(f"预期参数特征形状: ({batch_size}, {config.cad_max_total_len}, {config.cad_n_args}, {config.args_dim})")
+        print(f"预期参数逻辑形状: ({batch_size}, {config.cad_max_total_len}, {config.cad_n_args}, {config.args_vocab_size})")
         
     except Exception as e:
         print(f"\n前向传播期间发生错误: {e}")
