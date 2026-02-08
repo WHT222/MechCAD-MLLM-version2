@@ -13,7 +13,7 @@ if project_root not in sys.path:
 
 from src.model.model import MechCADModel, MechCADConfig
 from src.trainer.loss import CADLoss, UnifiedCADLoss
-from src.trainer.scheduler import GradualWarmupScheduler
+from src.trainer.scheduler import GradualWarmupScheduler, CosineAnnealingWarmupScheduler
 from src.trainer.base import BaseTrainer, TrainClock
 from src.utils.chamfer_distance import ChamferDistanceEvaluator
 from cadlib.macro import *
@@ -87,9 +87,18 @@ class MechCADTrainer(BaseTrainer):
 
         llava_path = getattr(cfg, 'llava_model_name', 'model_weights/llava-hf/llava-1.5-7b-hf')
 
+        # 多视图融合参数
+        num_views = getattr(cfg, 'num_selected_views', 2)
+        n_latents = getattr(cfg, 'n_latents', 64)
+
         print("正在初始化 MechCADModel...")
-        self.net = MechCADModel(model_cfg, llava_model_name=llava_path)
-        print("模型初始化完成。")
+        self.net = MechCADModel(
+            model_cfg,
+            llava_model_name=llava_path,
+            num_views=num_views,
+            n_latents=n_latents
+        )
+        print(f"模型初始化完成。(num_views={num_views}, n_latents={n_latents})")
 
         # 统计可训练参数
         trainable_params = sum(p.numel() for p in self.net.parameters() if p.requires_grad)
@@ -106,17 +115,37 @@ class MechCADTrainer(BaseTrainer):
 
     def set_optimizer(self, cfg):
         """设置优化器和学习率调度器"""
-        # 仅优化解码器参数 (LLaVA 编码器已冻结)
-        decoder_params = self.net.llm2cad_decoder.parameters()
+        # 优化解码器和多视图融合模块的参数 (LLaVA 编码器已冻结)
+        trainable_params = list(self.net.llm2cad_decoder.parameters())
+
+        # 如果不是纯文本模式，添加多视图融合模块参数
+        if not self.text_only:
+            trainable_params += list(self.net.multiview_fusion.parameters())
 
         self.optimizer = optim.AdamW(
-            decoder_params,
+            trainable_params,
             lr=cfg.lr,
             weight_decay=getattr(cfg, 'weight_decay', 0.01)
         )
 
-        warmup_steps = getattr(cfg, 'warmup_step', 1000)
-        self.scheduler = GradualWarmupScheduler(self.optimizer, 1.0, warmup_steps)
+        # 学习率调度器: Warmup + Cosine Decay
+        warmup_steps = getattr(cfg, 'warmup_step', 500)
+        total_steps = getattr(cfg, 'total_steps', None)
+
+        if total_steps is not None:
+            # 使用 Warmup + Cosine Decay
+            min_lr = getattr(cfg, 'min_lr', cfg.lr * 0.01)
+            self.scheduler = CosineAnnealingWarmupScheduler(
+                self.optimizer,
+                warmup_steps=warmup_steps,
+                total_steps=total_steps,
+                min_lr=min_lr
+            )
+            print(f"学习率调度: Warmup({warmup_steps}步) + Cosine Decay → {min_lr:.2e}")
+        else:
+            # 仅使用 Warmup（向后兼容）
+            self.scheduler = GradualWarmupScheduler(self.optimizer, 1.0, warmup_steps)
+            print(f"学习率调度: Warmup({warmup_steps}步)，无衰减")
 
     def forward(self, data):
         """

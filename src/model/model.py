@@ -15,6 +15,7 @@ if project_root not in sys.path:
 
 from src.model.layers.transformer import TransformerDecoder, TransformerDecoderLayer, LayerNorm
 from src.model.layers.positional_encoding import PositionalEncodingLUT
+from src.model.multiview_fusion import PerceiverFusion
 from cadlib.macro import *
 from src.unified_vocab.vocab import VOCAB_SIZE, MAX_ARGS_PER_CMD
 
@@ -185,25 +186,39 @@ class LLM2CADDecoder(nn.Module):
 class MechCADModel(nn.Module):
     """
     完整的 MechCAD 模型，将多模态输入转换为 CAD 序列。
+    支持多视图融合：使用 PerceiverFusion 融合多个视图的特征。
     """
-    def __init__(self, cfg: MechCADConfig, llava_model_name="model_weights/llava-hf/llava-1.5-7b-hf"):
+    def __init__(self, cfg: MechCADConfig, llava_model_name="model_weights/llava-hf/llava-1.5-7b-hf",
+                 num_views=2, n_latents=64):
         super().__init__()
         self.cfg = cfg
+        self.num_views = num_views
+
         # --- 编码层 ---
         self.processor = AutoProcessor.from_pretrained(llava_model_name)
-        
+
         quantization_config = BitsAndBytesConfig(
             load_in_4bit=True,
             bnb_4bit_compute_dtype=torch.float16,
             bnb_4bit_quant_type="nf4"
         )
-        
+
         self.llava_model = LlavaForConditionalGeneration.from_pretrained(
             llava_model_name,
             quantization_config=quantization_config,
             device_map="auto"
         )
         self.llava_model.eval()  # 冻结 LLaVA 模型参数
+
+        # --- 多视图融合模块 ---
+        self.multiview_fusion = PerceiverFusion(
+            hidden_dim=cfg.llm_hidden_dim,  # 4096
+            n_views=num_views,
+            n_latents=n_latents,
+            n_heads=8,
+            n_layers=2,
+            dropout=cfg.dropout
+        )
 
         # --- Decoder ---
         self.llm2cad_decoder = LLM2CADDecoder(cfg)
@@ -223,10 +238,11 @@ class MechCADModel(nn.Module):
 
         Args:
             batch: 包含 'images', 'text_caption', 'cad_sequence' 的字典
+                   images: (B, num_views, C, H, W) 多视图图像
             text_only: 是否仅使用文本模态（第一阶段训练）
 
         Returns:
-            包含 'command_logits', 'args_logits', 'angle_logits', 'pos_logits' 的字典
+            包含 'command_logits', 'unified_args_logits' 的字典
         """
         texts = batch['text_caption']    # 字符串列表
 
@@ -235,34 +251,75 @@ class MechCADModel(nn.Module):
             prompts = [f"USER: {caption}\nGenerate the CAD command sequence. ASSISTANT:"
                        for caption in texts]
             inputs = self.processor(text=prompts, return_tensors="pt", padding=True)
+
+            # 将输入移到与模型相同的设备上
+            for k, v in inputs.items():
+                if isinstance(v, torch.Tensor):
+                    inputs[k] = v.to(self.llava_model.device)
+
+            # 使用 LLaVA 编码
+            with torch.no_grad():
+                outputs = self.llava_model(**inputs, output_hidden_states=True)
+                llm_features = outputs.hidden_states[-1]  # [B, Seq, 4096]
+                memory_key_padding_mask = (inputs.attention_mask == 0)
+
         else:
-            # --- 多模态模式：使用图像+文本 ---
-            images_tensor = batch['images']  # (B, 8, C, H, W)
+            # --- 多视图模式：使用多个图像视图 + 文本 ---
+            images_tensor = batch['images']  # (B, num_views, C, H, W)
             batch_size = images_tensor.size(0)
+            num_views = images_tensor.size(1)
 
-            # 使用第一个视图，反归一化后转为 PIL 图像
-            pil_images = []
-            for i in range(batch_size):
-                img_np = self._denormalize_image(images_tensor[i, 0])
-                pil_images.append(Image.fromarray(img_np))
+            # 为每个视图分别获取 LLaVA 特征
+            all_view_features = []
+            all_attention_masks = []
 
-            # 创建 LLaVA 风格的提示
-            prompts = [f"USER: <image>\n{caption} ASSISTANT:" for caption in texts]
-            inputs = self.processor(text=prompts, images=pil_images, return_tensors="pt", padding=True)
+            for v in range(num_views):
+                # 反归一化后转为 PIL 图像
+                pil_images = []
+                for i in range(batch_size):
+                    img_np = self._denormalize_image(images_tensor[i, v])
+                    pil_images.append(Image.fromarray(img_np))
 
-        # 将输入移到与模型相同的设备上
-        for k, v in inputs.items():
-            if isinstance(v, torch.Tensor):
-                inputs[k] = v.to(self.llava_model.device)
+                # 创建 LLaVA 风格的提示
+                prompts = [f"USER: <image>\n{caption} ASSISTANT:" for caption in texts]
+                inputs = self.processor(text=prompts, images=pil_images, return_tensors="pt", padding=True)
 
-        # --- 使用 LLaVA 编码 ---
-        with torch.no_grad():
-            outputs = self.llava_model(**inputs, output_hidden_states=True)
-            llm_features = outputs.hidden_states[-1]
-            memory_key_padding_mask = (inputs.attention_mask == 0)
+                # 将输入移到与模型相同的设备上
+                for k, val in inputs.items():
+                    if isinstance(val, torch.Tensor):
+                        inputs[k] = val.to(self.llava_model.device)
+
+                # 使用 LLaVA 编码
+                with torch.no_grad():
+                    outputs = self.llava_model(**inputs, output_hidden_states=True)
+                    view_features = outputs.hidden_states[-1]  # [B, Seq, 4096]
+                    all_view_features.append(view_features)
+                    all_attention_masks.append(inputs.attention_mask)
+
+            # 将多视图特征堆叠: [B, num_views, Seq, Hidden]
+            # 由于不同视图可能有不同序列长度，需要对齐
+            max_seq_len = max(f.size(1) for f in all_view_features)
+            padded_features = []
+            for f in all_view_features:
+                if f.size(1) < max_seq_len:
+                    pad = torch.zeros(batch_size, max_seq_len - f.size(1), f.size(2),
+                                     device=f.device, dtype=f.dtype)
+                    f = torch.cat([f, pad], dim=1)
+                padded_features.append(f)
+
+            multiview_features = torch.stack(padded_features, dim=1)  # [B, num_views, Seq, 4096]
+
+            # 使用 PerceiverFusion 融合多视图特征
+            self.multiview_fusion.to(multiview_features.device)
+            llm_features = self.multiview_fusion(multiview_features.float())  # [B, n_latents, 4096]
+
+            # 融合后的特征没有 padding，创建全零的 mask
+            memory_key_padding_mask = torch.zeros(
+                batch_size, llm_features.size(1),
+                dtype=torch.bool, device=llm_features.device
+            )
 
         # --- 解码为 CAD 序列 ---
-        # 只移动到设备，不改变 dtype (保持 float32 以避免溢出)
         self.llm2cad_decoder.to(llm_features.device)
 
         command_logits, unified_args_logits = self.llm2cad_decoder(

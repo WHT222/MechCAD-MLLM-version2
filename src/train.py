@@ -71,6 +71,14 @@ class TrainConfig:
     # 训练模式
     text_only: bool = False  # 第一阶段：仅使用文本模态
 
+    # 多视图融合
+    num_selected_views: int = 2  # 随机选择的视图数量
+    n_latents: int = 64  # PerceiverFusion 可学习查询数量
+
+    # 学习率调度
+    use_cosine_decay: bool = True  # 是否使用 Cosine Decay
+    min_lr: float = 1e-6  # Cosine Decay 最小学习率
+
 
 def parse_args():
     """解析命令行参数"""
@@ -128,6 +136,18 @@ def parse_args():
     parser.add_argument("--text_only", action="store_true",
                         help="第一阶段：仅使用文本模态训练（跳过图像加载）")
 
+    # 多视图融合
+    parser.add_argument("--num_selected_views", type=int, default=2,
+                        help="多视图融合时随机选择的视图数量 (默认2)")
+    parser.add_argument("--n_latents", type=int, default=64,
+                        help="PerceiverFusion 可学习查询数量 (默认64)")
+
+    # 学习率调度
+    parser.add_argument("--use_cosine_decay", action="store_true",
+                        help="启用 Warmup + Cosine Decay 学习率调度")
+    parser.add_argument("--min_lr", type=float, default=1e-6,
+                        help="Cosine Decay 最小学习率 (默认1e-6)")
+
     return parser.parse_args()
 
 
@@ -159,7 +179,11 @@ def main():
         val_frequency=args.val_frequency,
         seed=args.seed,
         resume=args.resume,
-        text_only=args.text_only
+        text_only=args.text_only,
+        num_selected_views=args.num_selected_views,
+        n_latents=args.n_latents,
+        use_cosine_decay=args.use_cosine_decay,
+        min_lr=args.min_lr
     )
 
     print("=" * 60)
@@ -234,6 +258,16 @@ def main():
         num_workers=cfg.num_workers,
         pin_memory=True
     )
+
+    # 计算 total_steps (用于 Cosine Decay 学习率调度)
+    steps_per_epoch = len(train_loader)
+    total_steps = cfg.epochs * steps_per_epoch
+    cfg.total_steps = total_steps if cfg.use_cosine_decay else None
+
+    print(f"\n每 Epoch 步数: {steps_per_epoch}")
+    print(f"总训练步数: {total_steps}")
+    if cfg.use_cosine_decay:
+        print(f"学习率调度: Warmup({cfg.warmup_step}步) + Cosine Decay → {cfg.min_lr:.2e}")
 
     # 2. 初始化训练器
     print("\n[2/4] 初始化训练器...")
