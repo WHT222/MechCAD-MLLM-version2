@@ -396,53 +396,40 @@ class MechCADTrainer(BaseTrainer):
 
     def logits2vec(self, outputs, refill_pad=True):
         """
-        将模型输出转换为 CAD 向量。
+        将模型输出转换为 CAD 向量（统一词表版本）。
 
         Args:
             outputs: 模型输出字典
+                - command_logits: [B, S, n_commands]
+                - unified_args_logits: [B, S, MAX_ARGS_PER_CMD, VOCAB_SIZE]
             refill_pad: 是否将未使用的参数填充为 -1
 
         Returns:
             cad_vec: [B, S, 13] numpy 数组
         """
+        from src.unified_vocab.converter import unified_tokens_to_13d
+
         cmd_logits = outputs['command_logits']
-        args_logits = outputs['args_logits']
-        angle_logits = outputs['angle_logits']
-        pos_logits = outputs['pos_logits']
+        unified_args_logits = outputs['unified_args_logits']
 
         # 命令预测
         pred_commands = cmd_logits.argmax(dim=-1)  # [B, S]
 
-        # 参数预测 (减1恢复原始范围)
-        pred_args = args_logits.argmax(dim=-1) - 1  # [B, S, 12]
+        # 参数token预测
+        pred_args_tokens = unified_args_logits.argmax(dim=-1)  # [B, S, MAX_ARGS_PER_CMD]
 
-        # 角度和位置 Token 预测
-        pred_angle = angle_logits.argmax(dim=-1)  # [B, S]
-        pred_pos = pos_logits.argmax(dim=-1)  # [B, S]
+        # 转换为numpy
+        pred_commands_np = pred_commands.detach().cpu().numpy()
+        pred_args_tokens_np = pred_args_tokens.detach().cpu().numpy()
 
-        # 对于 Ext 命令，用 token 预测覆盖对应参数位置
-        ext_mask = (pred_commands == EXT_IDX)
-        pred_args[:, :, 5] = torch.where(ext_mask, pred_angle, pred_args[:, :, 5])
-        pred_args[:, :, 6] = torch.where(ext_mask, pred_pos, pred_args[:, :, 6])
+        # 批量转换为13维CAD向量
+        B, S = pred_commands_np.shape
+        cad_vecs = []
+        for b in range(B):
+            cad_vec = unified_tokens_to_13d(pred_commands_np[b], pred_args_tokens_np[b])
+            cad_vecs.append(cad_vec)
 
-        if refill_pad:
-            # 根据命令类型填充未使用的参数为 -1
-            # 适配13D向量的命令-参数掩码 (12个参数)
-            cmd_args_mask_13d = torch.tensor([
-                [1, 1, 0, 0, 0,  0, 0,  0, 0, 0, 0, 0],  # Line: x, y
-                [1, 1, 1, 1, 0,  0, 0,  0, 0, 0, 0, 0],  # Arc: x, y, alpha, f
-                [1, 1, 0, 0, 1,  0, 0,  0, 0, 0, 0, 0],  # Circle: x, y, r
-                [0, 0, 0, 0, 0,  0, 0,  0, 0, 0, 0, 0],  # EOS: 无参数
-                [0, 0, 0, 0, 0,  0, 0,  0, 0, 0, 0, 0],  # SOL: 无参数
-                [0, 0, 0, 0, 0,  1, 1,  1, 1, 1, 1, 1],  # Ext: angle, pos, e1-e2-b-u-s
-            ], dtype=torch.float32, device=pred_commands.device)
-            mask = cmd_args_mask_13d[pred_commands.long()]  # [B, S, 12]
-            pred_args = torch.where(mask.bool(), pred_args, torch.tensor(-1, device=pred_args.device))
-
-        # 组合为 13 维向量
-        cad_vec = torch.cat([pred_commands.unsqueeze(-1), pred_args], dim=-1)
-
-        return cad_vec.detach().cpu().numpy()
+        return np.stack(cad_vecs, axis=0)  # [B, S, 13]
 
     def save_ckpt(self, name=None):
         """保存检查点"""
