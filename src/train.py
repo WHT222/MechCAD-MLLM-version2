@@ -132,6 +132,8 @@ def parse_args():
     # 恢复
     parser.add_argument("--resume", type=str, default=None,
                         help="从检查点恢复训练")
+    parser.add_argument("--reset_scheduler", action="store_true",
+                        help="恢复时重置学习率调度器（跨阶段训练时使用）")
 
     # 训练模式
     parser.add_argument("--text_only", action="store_true",

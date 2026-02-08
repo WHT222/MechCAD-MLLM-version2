@@ -494,10 +494,15 @@ class MechCADTrainer(BaseTrainer):
                 raise FileNotFoundError(f"未找到检查点: {self.model_dir}")
             ckpts.sort(key=lambda x: int(x.split('epoch')[1].split('.')[0]))
             name = ckpts[-1].replace('.pth', '')
-
-        load_path = os.path.join(self.model_dir, f"{name}.pth")
-        if not os.path.exists(load_path):
-            load_path = os.path.join(self.model_dir, name)
+            load_path = os.path.join(self.model_dir, f"{name}.pth")
+        elif os.path.isabs(name) or os.path.exists(name):
+            # 如果是绝对路径或已存在的路径，直接使用
+            load_path = name
+        else:
+            # 相对于 model_dir 的路径
+            load_path = os.path.join(self.model_dir, f"{name}.pth")
+            if not os.path.exists(load_path):
+                load_path = os.path.join(self.model_dir, name)
 
         if not os.path.exists(load_path):
             raise FileNotFoundError(f"检查点不存在: {load_path}")
@@ -506,10 +511,43 @@ class MechCADTrainer(BaseTrainer):
         # weights_only=False 用于加载包含自定义类 (MechCADConfig) 的检查点
         checkpoint = torch.load(load_path, map_location='cpu', weights_only=False)
 
+        # 加载模型权重
         self.net.llm2cad_decoder.load_state_dict(checkpoint['decoder_state_dict'])
-        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-        self.clock.restore_checkpoint(checkpoint['clock'])
+
+        # 如果有多视图融合权重，也加载
+        if 'fusion_state_dict' in checkpoint:
+            self.net.multiview_fusion.load_state_dict(checkpoint['fusion_state_dict'])
+
+        # 是否恢复优化器和调度器状态（跨阶段训练时需要重置）
+        reset_scheduler = getattr(self.cfg, 'reset_scheduler', False)
+
+        if not reset_scheduler:
+            try:
+                # 检查优化器参数组是否匹配
+                saved_param_count = sum(
+                    len(g['params']) for g in checkpoint['optimizer_state_dict']['param_groups']
+                )
+                current_param_count = sum(
+                    len(list(g['params'])) for g in self.optimizer.param_groups
+                )
+
+                if saved_param_count != current_param_count:
+                    print(f"警告: 优化器参数组大小不匹配 (保存:{saved_param_count} vs 当前:{current_param_count})")
+                    print("跨阶段训练时参数组变化，将使用新的优化器和调度器")
+                    reset_scheduler = True
+                else:
+                    self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+                    self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+                    self.clock.restore_checkpoint(checkpoint['clock'])
+                    print("已恢复优化器和调度器状态")
+            except Exception as e:
+                print(f"警告: 无法恢复优化器/调度器状态 ({e})")
+                print("将使用新的调度器")
+                reset_scheduler = True
+
+        if reset_scheduler:
+            print("学习率调度器已重置（从新的 warmup 开始）")
+            self.clock.reset()  # 重置训练计数器
 
         # 移到正确设备
         device = next(self.net.llava_model.parameters()).device

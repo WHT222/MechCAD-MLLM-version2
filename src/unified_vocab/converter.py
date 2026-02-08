@@ -117,7 +117,7 @@ def unified_tokens_to_13d(commands: np.ndarray, args_tokens: np.ndarray) -> np.n
     Returns:
         cad_vec_13d: [S, 13] CAD向量
     """
-    from .vocab import token_to_param, token_to_angle, token_to_pos, PAD_VAL
+    from .vocab import token_to_param, token_to_angle, token_to_pos, PAD_TOKEN
 
     S = commands.shape[0]
     cad_vec_13d = np.full((S, 13), -1, dtype=np.int32)

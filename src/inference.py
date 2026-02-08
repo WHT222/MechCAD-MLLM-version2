@@ -155,6 +155,32 @@ def decode_cad_sequence(cad_vec):
     return commands
 
 
+def truncate_at_eos(cad_vec):
+    """
+    在第一个 EOS 之后截断序列，将后续命令都设为 EOS。
+
+    Args:
+        cad_vec: [S, 13] CAD 向量序列
+
+    Returns:
+        truncated_vec: 截断后的 CAD 向量
+        valid_length: 有效命令数（包括第一个 EOS）
+    """
+    cad_vec = cad_vec.copy()
+    eos_positions = np.where(cad_vec[:, 0] == EOS_IDX)[0]
+
+    if len(eos_positions) > 0:
+        first_eos = eos_positions[0]
+        # 将 EOS 之后的所有命令设为 EOS
+        cad_vec[first_eos + 1:, 0] = EOS_IDX
+        cad_vec[first_eos + 1:, 1:] = -1  # 参数设为无效
+        valid_length = first_eos + 1
+    else:
+        valid_length = len(cad_vec)
+
+    return cad_vec, valid_length
+
+
 def main():
     parser = argparse.ArgumentParser(description="MechCAD-MLLM 推理测试")
     parser.add_argument("--checkpoint", type=str, required=True,
@@ -191,6 +217,9 @@ def main():
     print("\n正在生成 CAD 序列...")
     cad_vec, outputs = generate_cad(model, args.text, args.image, text_only)
 
+    # 在 EOS 处截断
+    cad_vec, valid_length = truncate_at_eos(cad_vec)
+
     # 解析并显示结果
     print("\n" + "=" * 60)
     print("生成的 CAD 序列:")
@@ -201,8 +230,7 @@ def main():
         print(cmd)
 
     # 统计
-    valid_commands = sum(1 for vec in cad_vec if vec[0] != EOS_IDX)
-    print(f"\n有效命令数: {valid_commands}")
+    print(f"\n有效命令数: {valid_length}")
 
     # 保存结果
     if args.output:

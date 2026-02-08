@@ -171,3 +171,9 @@ class TrainClock(object):
         self.epoch = clock_dict['epoch']
         self.minibatch = clock_dict['minibatch']
         self.step = clock_dict['step']
+
+    def reset(self):
+        """重置训练计数器（跨阶段训练时使用）"""
+        self.epoch = 1
+        self.minibatch = 0
+        self.step = 0
