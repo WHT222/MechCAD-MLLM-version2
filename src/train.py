@@ -78,6 +78,7 @@ class TrainConfig:
     # 学习率调度
     use_cosine_decay: bool = True  # 是否使用 Cosine Decay
     min_lr: float = 1e-6  # Cosine Decay 最小学习率
+    total_steps: Optional[int] = None  # 总训练步数 (自动计算)
 
 
 def parse_args():
