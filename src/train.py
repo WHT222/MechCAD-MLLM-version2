@@ -9,6 +9,8 @@ MechCAD-MLLM 训练脚本
 import os
 import sys
 import argparse
+import json
+from datetime import datetime
 from dataclasses import dataclass
 from typing import Optional
 import torch
@@ -80,6 +82,7 @@ class TrainConfig:
     use_cosine_decay: bool = True  # 是否使用 Cosine Decay
     min_lr: float = 1e-6  # Cosine Decay 最小学习率
     total_steps: Optional[int] = None  # 总训练步数 (自动计算)
+    metrics_output: Optional[str] = None  # 测试指标输出路径（默认 model_dir/test_metrics.json）
 
 
 def parse_args():
@@ -151,6 +154,8 @@ def parse_args():
                         help="启用 Warmup + Cosine Decay 学习率调度")
     parser.add_argument("--min_lr", type=float, default=1e-6,
                         help="Cosine Decay 最小学习率 (默认1e-6)")
+    parser.add_argument("--metrics_output", type=str, default=None,
+                        help="测试指标输出路径（默认 model_dir/test_metrics.json）")
 
     return parser.parse_args()
 
@@ -188,7 +193,8 @@ def main():
         num_selected_views=args.num_selected_views,
         n_latents=args.n_latents,
         use_cosine_decay=args.use_cosine_decay,
-        min_lr=args.min_lr
+        min_lr=args.min_lr,
+        metrics_output=args.metrics_output
     )
 
     print("=" * 60)
@@ -341,6 +347,49 @@ def main():
         print(f"  SegE: {eval_metrics.get('sege', -1.0):.4f}")
         print(f"  DangEL: {eval_metrics.get('dangel', -1.0):.4f}")
         print(f"  DangEL(norm): {eval_metrics.get('dangel_norm', -1.0):.6f}")
+
+        # 保存测试集评估指标，供前端读取展示
+        def _to_serializable(obj):
+            if isinstance(obj, dict):
+                return {k: _to_serializable(v) for k, v in obj.items()}
+            if isinstance(obj, (list, tuple)):
+                return [_to_serializable(v) for v in obj]
+            if isinstance(obj, torch.Tensor):
+                return obj.detach().cpu().tolist()
+            # numpy scalar / python scalar
+            if hasattr(obj, "item"):
+                try:
+                    return obj.item()
+                except Exception:
+                    pass
+            return obj
+
+        metrics_payload = {
+            "timestamp": datetime.now().isoformat(timespec="seconds"),
+            "checkpoint": os.path.join(cfg.model_dir, "best.pth"),
+            "test_loss": float(test_loss),
+            "test_metrics": _to_serializable(test_metrics),
+            "eval_metrics": _to_serializable(eval_metrics),
+            "config": {
+                "text_only": bool(cfg.text_only),
+                "batch_size": int(cfg.batch_size),
+                "lr": float(cfg.lr),
+                "epochs": int(cfg.epochs),
+                "num_selected_views": int(cfg.num_selected_views),
+                "n_latents": int(cfg.n_latents),
+                "seed": int(cfg.seed),
+                "test_split": float(cfg.test_split),
+                "val_split": float(cfg.val_split),
+            }
+        }
+
+        metrics_output_path = cfg.metrics_output or os.path.join(cfg.model_dir, "test_metrics.json")
+        metrics_output_dir = os.path.dirname(metrics_output_path)
+        if metrics_output_dir:
+            os.makedirs(metrics_output_dir, exist_ok=True)
+        with open(metrics_output_path, "w", encoding="utf-8") as f:
+            json.dump(metrics_payload, f, indent=2, ensure_ascii=False)
+        print(f"  测试指标已保存: {metrics_output_path}")
 
     print("\n" + "=" * 60)
     print("训练完成!")

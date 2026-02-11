@@ -338,6 +338,30 @@ def list_checkpoints(model_dir):
     return "\n".join(ckpts) if ckpts else "无检查点"
 
 
+def load_test_metrics_file(metrics_path):
+    """
+    读取训练后保存的测试指标 JSON。
+    支持传入文件路径，或传入模型目录（自动读取 test_metrics.json）。
+    """
+    try:
+        if not metrics_path:
+            return {}, "❌ 请输入指标文件路径或模型目录"
+
+        if os.path.isdir(metrics_path):
+            metrics_path = os.path.join(metrics_path, "test_metrics.json")
+
+        if not os.path.exists(metrics_path):
+            return {}, f"❌ 文件不存在: {metrics_path}"
+
+        with open(metrics_path, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+
+        status = f"✅ 已加载测试指标: {metrics_path}"
+        return payload, status
+    except Exception as e:
+        return {}, f"❌ 读取失败: {e}"
+
+
 # ============== Gradio 界面 ==============
 def create_ui():
     """创建 Gradio 界面"""
@@ -426,8 +450,21 @@ def create_ui():
                 with gr.Row():
                     train_plot = gr.Plot(label="训练曲线")
 
+                with gr.Row():
+                    with gr.Column(scale=1):
+                        metrics_path = gr.Textbox(
+                            label="测试指标文件/目录",
+                            placeholder="outputs/checkpoints/test_metrics.json 或 outputs/checkpoints",
+                            value="outputs/checkpoints/test_metrics.json"
+                        )
+                        load_metrics_btn = gr.Button("读取测试指标", variant="primary")
+                        metrics_status = gr.Textbox(label="指标读取状态", interactive=False)
+                    with gr.Column(scale=1):
+                        metrics_json = gr.JSON(label="测试集评估指标")
+
                 refresh_btn.click(plot_training_curves, inputs=[log_dir], outputs=[train_plot, log_status])
                 list_btn.click(list_checkpoints, inputs=[model_dir], outputs=[ckpt_list])
+                load_metrics_btn.click(load_test_metrics_file, inputs=[metrics_path], outputs=[metrics_json, metrics_status])
 
             # ===== 示例 =====
             with gr.TabItem("📝 示例"):
