@@ -199,8 +199,9 @@ class OmniCADDataset(Dataset):
             cad_tensor = torch.from_numpy(padded_cad_vec).long()
         except Exception as e:
             print(f"警告: 无法加载或处理h5文件 {h5_path}: {e}")
-            # 返回一个表示错误的空Tensor
-            cad_tensor = torch.full((MAX_TOTAL_LEN, 13), EOS_IDX, dtype=torch.long)
+            # 返回一个表示错误的空Tensor，并确保后续转换使用一致的兜底数组
+            padded_cad_vec = np.full((MAX_TOTAL_LEN, 13), EOS_IDX, dtype=np.int32)
+            cad_tensor = torch.from_numpy(padded_cad_vec).long()
 
         # 2. 加载文本描述
         text_caption = self.text_captions.get(sample_id, "No description available.")

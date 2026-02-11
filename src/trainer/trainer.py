@@ -52,6 +52,12 @@ class MechCADTrainer(BaseTrainer):
         self.batch_size = cfg.batch_size
         self.text_only = getattr(cfg, 'text_only', False)
 
+        # 混合精度训练
+        self.use_amp = getattr(cfg, 'use_amp', True)
+        if self.use_amp:
+            self.scaler = torch.cuda.amp.GradScaler()
+            print("启用混合精度训练 (AMP)")
+
         # 确保目录存在
         os.makedirs(self.log_dir, exist_ok=True)
         os.makedirs(self.model_dir, exist_ok=True)
@@ -368,7 +374,9 @@ class MechCADTrainer(BaseTrainer):
                 eval_mask = cmd_match & valid_mask
 
                 if eval_mask.sum() > 0:
-                    pred_args = outputs['args_logits'].argmax(dim=-1) - 1
+                    # 统一词表版本: 先解码为13维CAD向量，再计算参数误差
+                    pred_vec_t = torch.from_numpy(pred_vec).to(device)
+                    pred_args = pred_vec_t[:, :, 1:]
                     gt_args = cad_seq[:, :, 1:]
                     args_diff = torch.abs(pred_args - gt_args).float()
                     total_args_error += (args_diff * eval_mask.unsqueeze(-1)).sum().item()
@@ -468,20 +476,27 @@ class MechCADTrainer(BaseTrainer):
         else:
             save_path = os.path.join(self.model_dir, f"{name}.pth")
 
-        # 仅保存解码器权重 (LLaVA 太大且已冻结)
+        # 仅保存可训练模块权重 (LLaVA 太大且已冻结)
         decoder_state = self.net.llm2cad_decoder.cpu().state_dict()
-
-        torch.save({
+        checkpoint_dict = {
             'clock': self.clock.make_checkpoint(),
             'decoder_state_dict': decoder_state,
             'optimizer_state_dict': self.optimizer.state_dict(),
             'scheduler_state_dict': self.scheduler.state_dict(),
             'model_cfg': self.model_cfg
-        }, save_path)
+        }
+
+        # 多模态阶段额外保存融合模块权重
+        if not self.text_only:
+            fusion_state = self.net.multiview_fusion.cpu().state_dict()
+            checkpoint_dict['fusion_state_dict'] = fusion_state
+
+        torch.save(checkpoint_dict, save_path)
 
         # 移回 GPU
         device = next(self.net.llava_model.parameters()).device
         self.net.llm2cad_decoder.to(device)
+        self.net.multiview_fusion.to(device)
 
         print(f"检查点已保存到: {save_path}")
 

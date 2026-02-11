@@ -216,21 +216,19 @@ def load_training_logs(log_dir):
 
         data = {'train': {}, 'val': {}}
 
-        # 查找事件文件
+        # 加载事件文件 - 直接传入目录路径，EventAccumulator 会自动合并所有事件文件
         for mode, path in [('train', train_dir), ('val', val_dir)]:
-            event_files = glob.glob(os.path.join(path, 'events.out.tfevents.*'))
-            if not event_files:
-                event_files = glob.glob(path + '*')
-
-            if event_files:
-                ea = event_accumulator.EventAccumulator(event_files[0])
+            if os.path.isdir(path):
+                ea = event_accumulator.EventAccumulator(path)
                 ea.Reload()
 
                 for tag in ea.Tags()['scalars']:
                     events = ea.Scalars(tag)
+                    # 按 step 排序，确保曲线连续
+                    sorted_events = sorted(events, key=lambda e: e.step)
                     data[mode][tag] = {
-                        'steps': [e.step for e in events],
-                        'values': [e.value for e in events]
+                        'steps': [e.step for e in sorted_events],
+                        'values': [e.value for e in sorted_events]
                     }
 
         return data
@@ -375,7 +373,7 @@ def create_ui():
                         log_dir = gr.Textbox(
                             label="日志目录",
                             placeholder="outputs/logs",
-                            value="outputs/logs"
+                            value="outputs/stage1_log"
                         )
                         refresh_btn = gr.Button("刷新训练曲线", variant="primary")
                         log_status = gr.Textbox(label="状态", interactive=False)
@@ -402,19 +400,11 @@ def create_ui():
 
                 尝试以下描述来生成 CAD 模型：
 
-                **简单形状:**
-                - `A simple cylinder`
-                - `A cube with rounded edges`
-                - `A hollow tube`
+                
+                - `Generate a CAD model with a square base and a central circular hole`
+                - `Generate a CAD model with a rectangular prism shape, featuring a uniform gray color and smooth surfaces`
+                - `Generate a CAD model with a cylindrical shape featuring a hollow center and a split along one side, resembling a segmented ring`
 
-                **复杂形状:**
-                - `A cylinder with a central hole`
-                - `A rectangular block with two holes`
-                - `A gear-like shape with 6 teeth`
-
-                **详细描述:**
-                - `A cylindrical container with thick walls and a flat bottom`
-                - `A bracket with mounting holes at each corner`
 
                 ### 使用提示
 

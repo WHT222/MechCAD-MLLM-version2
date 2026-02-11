@@ -67,6 +67,7 @@ class TrainConfig:
 
     # 恢复训练
     resume: Optional[str] = None  # 检查点路径
+    reset_scheduler: bool = False  # 恢复时重置调度器（跨阶段训练）
 
     # 训练模式
     text_only: bool = False  # 第一阶段：仅使用文本模态
@@ -182,6 +183,7 @@ def main():
         val_frequency=args.val_frequency,
         seed=args.seed,
         resume=args.resume,
+        reset_scheduler=args.reset_scheduler,
         text_only=args.text_only,
         num_selected_views=args.num_selected_views,
         n_latents=args.n_latents,
@@ -218,7 +220,8 @@ def main():
         sample_limit=cfg.sample_limit,
         category_start=cfg.category_start,
         category_end=cfg.category_end,
-        text_only=cfg.text_only
+        text_only=cfg.text_only,
+        num_selected_views=cfg.num_selected_views
     )
 
     # 划分训练/验证/测试集 (三集划分)
@@ -294,8 +297,7 @@ def main():
         )
         print(f"\nEpoch {epoch} 训练损失: {train_loss:.4f}")
 
-        # 更新学习率
-        trainer.update_learning_rate()
+        # 学习率在 train_epoch 内按 step 更新，这里不再重复 step
 
         # 验证
         if epoch % cfg.eval_every == 0:

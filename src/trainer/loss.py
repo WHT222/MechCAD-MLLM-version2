@@ -298,12 +298,13 @@ class UnifiedCADLoss(nn.Module):
 
         # 构建参数位置掩码: 哪些位置对哪些命令有效
         # [n_commands, MAX_ARGS_PER_CMD]
-        from src.unified_vocab.vocab import CMD_ARG_COUNTS
+        # 使用完整参数序列模板长度（包含边界Token和SEP）。
+        from src.unified_vocab.vocab import CMD_SEQUENCE_TEMPLATES
         args_mask = np.zeros((self.n_commands, MAX_ARGS_PER_CMD), dtype=np.float32)
-        for cmd_idx, n_args in CMD_ARG_COUNTS.items():
-            if cmd_idx < self.n_commands:
-                # 有效参数位置 (含边界Token和SEP)
-                args_mask[cmd_idx, :n_args + 1] = 1.0
+        for cmd_idx in range(self.n_commands):
+            template = CMD_SEQUENCE_TEMPLATES.get(cmd_idx, ['SEP'])
+            seq_len = min(len(template), MAX_ARGS_PER_CMD)
+            args_mask[cmd_idx, :seq_len] = 1.0
         self.register_buffer("args_mask", torch.tensor(args_mask))
 
     def forward(self, outputs, batch):
