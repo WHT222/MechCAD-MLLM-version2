@@ -17,6 +17,7 @@ import json
 import glob
 import argparse
 import numpy as np
+from datetime import datetime
 from pathlib import Path
 
 # 添加项目根目录
@@ -35,6 +36,7 @@ from PIL import Image
 
 from src.model.model import MechCADModel, MechCADConfig
 from src.unified_vocab.converter import unified_tokens_to_13d
+from src.utils.cad_export import export_from_cad13
 from cadlib.macro import *
 
 
@@ -82,12 +84,12 @@ def load_model(checkpoint_path, llava_path="model_weights/llava-hf/llava-1.5-7b-
 
 
 # ============== CAD 生成 ==============
-def generate_cad(text_input, image_input, use_image):
+def generate_cad(text_input, image_input, use_image, export_stl):
     """生成 CAD 序列"""
     global MODEL
 
     if MODEL is None:
-        return "❌ 请先加载模型", "", None
+        return "❌ 请先加载模型", "", "", None, None, None
 
     try:
         text_only = not use_image or image_input is None
@@ -139,11 +141,37 @@ def generate_cad(text_input, image_input, use_image):
         formatted_output = format_cad_sequence(cad_vec, valid_length)
         raw_output = format_raw_vector(cad_vec[:valid_length])
 
-        return f"✅ 生成成功 (有效命令数: {valid_length})", formatted_output, raw_output
+        # 导出模型文件和预览图
+        status = f"✅ 生成成功 (有效命令数: {valid_length})"
+        preview_path = None
+        step_path = None
+        stl_path = None
+
+        try:
+            out_dir = os.path.join("outputs", "ui_generated_models")
+            safe_text = "".join(c if c.isalnum() else "_" for c in text_input).strip("_")
+            safe_text = safe_text[:40] if safe_text else "cad"
+            stem = f"{safe_text}_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
+
+            artifacts = export_from_cad13(
+                cad_vec[:valid_length],
+                output_dir=out_dir,
+                stem=stem,
+                export_step=True,
+                export_stl=bool(export_stl),
+                export_preview=True
+            )
+            preview_path = artifacts.get('preview_path')
+            step_path = artifacts.get('step_path')
+            stl_path = artifacts.get('stl_path')
+        except Exception as export_err:
+            status += f"\n⚠️ 模型导出失败: {export_err}"
+
+        return status, formatted_output, raw_output, preview_path, step_path, stl_path
 
     except Exception as e:
         import traceback
-        return f"❌ 生成失败: {str(e)}\n{traceback.format_exc()}", "", None
+        return f"❌ 生成失败: {str(e)}\n{traceback.format_exc()}", "", "", None, None, None
 
 
 def truncate_at_eos(cad_vec):
@@ -340,6 +368,7 @@ def create_ui():
                         )
                         use_image = gr.Checkbox(label="使用图像（多模态模式）", value=False)
                         image_input = gr.Image(label="输入图像", visible=False)
+                        export_stl = gr.Checkbox(label="导出 STL 文件", value=False)
 
                         generate_btn = gr.Button("生成 CAD 序列", variant="primary")
 
@@ -356,14 +385,21 @@ def create_ui():
                             lines=10,
                             interactive=False
                         )
+                        preview_image = gr.Image(
+                            label="模型预览图",
+                            type="filepath",
+                            interactive=False
+                        )
+                        step_file = gr.File(label="STEP 文件", interactive=False)
+                        stl_file = gr.File(label="STL 文件", interactive=False)
 
                 # 事件绑定
                 load_btn.click(load_model, inputs=[ckpt_path], outputs=[load_status])
                 use_image.change(lambda x: gr.update(visible=x), inputs=[use_image], outputs=[image_input])
                 generate_btn.click(
                     generate_cad,
-                    inputs=[text_input, image_input, use_image],
-                    outputs=[gen_status, cad_output, raw_output]
+                    inputs=[text_input, image_input, use_image, export_stl],
+                    outputs=[gen_status, cad_output, raw_output, preview_image, step_file, stl_file]
                 )
 
             # ===== 训练监控 =====

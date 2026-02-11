@@ -15,6 +15,7 @@ MechCAD-MLLM 推理脚本
 import os
 import sys
 import argparse
+from datetime import datetime
 import torch
 import numpy as np
 from PIL import Image
@@ -26,6 +27,7 @@ if project_root not in sys.path:
 
 from src.model.model import MechCADModel, MechCADConfig
 from src.unified_vocab.converter import unified_tokens_to_13d
+from src.utils.cad_export import export_from_cad13
 from cadlib.macro import *
 
 
@@ -194,6 +196,12 @@ def main():
                         help="LLaVA 模型路径")
     parser.add_argument("--output", type=str, default=None,
                         help="保存生成的 CAD 向量到文件 (可选)")
+    parser.add_argument("--export_dir", type=str, default=None,
+                        help="导出模型文件和预览图的目录 (可选)")
+    parser.add_argument("--export_stl", action="store_true",
+                        help="导出 STL 文件 (默认只导出 STEP)")
+    parser.add_argument("--no_preview", action="store_true",
+                        help="不导出预览图")
     parser.add_argument("--text_only", action="store_true",
                         help="强制使用纯文本模式")
 
@@ -236,6 +244,32 @@ def main():
     if args.output:
         np.save(args.output, cad_vec)
         print(f"\nCAD 向量已保存到: {args.output}")
+
+    # 导出 CAD 模型文件和预览图
+    if args.export_dir:
+        safe_text = "".join(c if c.isalnum() else "_" for c in args.text).strip("_")
+        safe_text = safe_text[:40] if safe_text else "cad"
+        stem = f"{safe_text}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+
+        print("\n正在导出 CAD 模型文件...")
+        try:
+            artifacts = export_from_cad13(
+                cad_vec[:valid_length],
+                output_dir=args.export_dir,
+                stem=stem,
+                export_step=True,
+                export_stl=args.export_stl,
+                export_preview=not args.no_preview,
+            )
+            print("导出完成:")
+            if 'step_path' in artifacts:
+                print(f"  STEP: {artifacts['step_path']}")
+            if 'stl_path' in artifacts:
+                print(f"  STL: {artifacts['stl_path']}")
+            if 'preview_path' in artifacts:
+                print(f"  预览图: {artifacts['preview_path']}")
+        except Exception as e:
+            print(f"导出失败: {e}")
 
     # 返回原始向量供进一步处理
     print("\n" + "=" * 60)
