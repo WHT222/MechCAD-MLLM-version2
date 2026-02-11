@@ -16,6 +16,7 @@ from src.trainer.loss import CADLoss, UnifiedCADLoss
 from src.trainer.scheduler import GradualWarmupScheduler, CosineAnnealingWarmupScheduler
 from src.trainer.base import BaseTrainer, TrainClock
 from src.utils.chamfer_distance import ChamferDistanceEvaluator
+from src.utils.mesh_metrics import SegEDangELEvaluator
 from cadlib.macro import *
 
 
@@ -399,28 +400,60 @@ class MechCADTrainer(BaseTrainer):
             'num_samples': sample_count
         }
 
-        # 计算 Chamfer Distance (几何相似度)
-        print("\n计算 Chamfer Distance...")
+        # 计算几何指标 (Chamfer / SegE / DangEL)
+        print("\n计算几何指标 (Chamfer / SegE / DangEL)...")
         try:
-            cd_evaluator = ChamferDistanceEvaluator(n_points=2048, normalize=True)
+            if len(all_pred_vecs) == 0 or len(all_gt_vecs) == 0:
+                raise ValueError("无可用样本用于几何评估")
+
             # 合并所有预测和真实向量
             all_pred = np.concatenate(all_pred_vecs, axis=0)
             all_gt = np.concatenate(all_gt_vecs, axis=0)
+            geom_eval_count = min(100, len(all_pred), len(all_gt))  # 限制数量避免评估过慢
 
+            eval_pred_list = [all_pred[i] for i in range(geom_eval_count)]
+            eval_gt_list = [all_gt[i] for i in range(geom_eval_count)]
+
+            cd_evaluator = ChamferDistanceEvaluator(n_points=2048, normalize=True)
             cd_metrics = cd_evaluator.evaluate(
-                [all_pred[i] for i in range(min(100, len(all_pred)))],  # 限制数量避免太慢
-                [all_gt[i] for i in range(min(100, len(all_gt)))]
+                eval_pred_list,
+                eval_gt_list
             )
 
             metrics['chamfer_distance'] = cd_metrics['chamfer_distance']
             metrics['chamfer_valid_count'] = cd_metrics['valid_count']
             metrics['chamfer_failed_count'] = cd_metrics['failed_count']
 
-            print(f"[Chamfer Distance] CD: {cd_metrics['chamfer_distance']:.6f}, "
-                  f"有效: {cd_metrics['valid_count']}, 失败: {cd_metrics['failed_count']}")
+            seg_dangel_evaluator = SegEDangELEvaluator()
+            topo_metrics = seg_dangel_evaluator.evaluate(eval_pred_list, eval_gt_list)
+            metrics['sege'] = topo_metrics['sege']
+            metrics['sege_rel'] = topo_metrics['sege_rel']
+            metrics['dangel'] = topo_metrics['dangel']
+            metrics['dangel_norm'] = topo_metrics['dangel_norm']
+            metrics['mesh_valid_count'] = topo_metrics['valid_count']
+            metrics['mesh_failed_count'] = topo_metrics['failed_count']
+
+            print(
+                f"[Chamfer] CD: {cd_metrics['chamfer_distance']:.6f}, "
+                f"有效: {cd_metrics['valid_count']}, 失败: {cd_metrics['failed_count']}"
+            )
+            print(
+                f"[SegE/DangEL] SegE: {topo_metrics['sege']:.4f}, "
+                f"DangEL: {topo_metrics['dangel']:.4f}, "
+                f"DangEL(norm): {topo_metrics['dangel_norm']:.6f}, "
+                f"有效: {topo_metrics['valid_count']}, 失败: {topo_metrics['failed_count']}"
+            )
         except Exception as e:
-            print(f"Chamfer Distance 计算失败: {e}")
+            print(f"几何指标计算失败: {e}")
             metrics['chamfer_distance'] = -1.0
+            metrics['chamfer_valid_count'] = 0
+            metrics['chamfer_failed_count'] = 0
+            metrics['sege'] = -1.0
+            metrics['sege_rel'] = -1.0
+            metrics['dangel'] = -1.0
+            metrics['dangel_norm'] = -1.0
+            metrics['mesh_valid_count'] = 0
+            metrics['mesh_failed_count'] = 0
 
         print(f"\n[Evaluate] 命令准确率: {cmd_accuracy*100:.2f}%, 参数MAE: {args_mae:.4f}")
 
@@ -428,6 +461,14 @@ class MechCADTrainer(BaseTrainer):
         if self.use_tensorboard:
             self.val_tb.add_scalar('eval/cmd_accuracy', cmd_accuracy, self.clock.epoch)
             self.val_tb.add_scalar('eval/args_mae', args_mae, self.clock.epoch)
+            if 'chamfer_distance' in metrics:
+                self.val_tb.add_scalar('eval/chamfer_distance', metrics['chamfer_distance'], self.clock.epoch)
+            if 'sege' in metrics:
+                self.val_tb.add_scalar('eval/sege', metrics['sege'], self.clock.epoch)
+            if 'dangel' in metrics:
+                self.val_tb.add_scalar('eval/dangel', metrics['dangel'], self.clock.epoch)
+            if 'dangel_norm' in metrics:
+                self.val_tb.add_scalar('eval/dangel_norm', metrics['dangel_norm'], self.clock.epoch)
 
         return metrics
 

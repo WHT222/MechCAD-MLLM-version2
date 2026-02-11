@@ -337,6 +337,10 @@ def main():
     if len(test_dataset) > 0:
         eval_metrics = trainer.evaluate(test_loader, max_samples=min(500, len(test_dataset)))
         print(f"  参数MAE: {eval_metrics['args_mae']:.4f}")
+        print(f"  Chamfer Distance: {eval_metrics.get('chamfer_distance', -1.0):.6f}")
+        print(f"  SegE: {eval_metrics.get('sege', -1.0):.4f}")
+        print(f"  DangEL: {eval_metrics.get('dangel', -1.0):.4f}")
+        print(f"  DangEL(norm): {eval_metrics.get('dangel_norm', -1.0):.6f}")
 
     print("\n" + "=" * 60)
     print("训练完成!")
