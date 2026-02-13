@@ -178,13 +178,16 @@ class ChamferDistanceEvaluator:
         """
         self.n_points = n_points
         self.normalize = normalize
+        self._cad13_to_cad17_numerical = None
 
         # 尝试导入 CAD 相关模块
         self._cad_available = False
         try:
             from cadlib.visualize import vec2CADsolid, CADsolid2pc
+            from src.utils.cad_export import cad13_to_cad17_numerical
             self._vec2CADsolid = vec2CADsolid
             self._CADsolid2pc = CADsolid2pc
+            self._cad13_to_cad17_numerical = cad13_to_cad17_numerical
             self._cad_available = True
         except ImportError:
             print("警告: cadlib 不可用，Chamfer Distance 评估将使用简化模式")
@@ -215,8 +218,18 @@ class ChamferDistanceEvaluator:
             return None
 
         try:
+            cad_vec = np.asarray(cad_vec)
+            if cad_vec.ndim != 2:
+                return None
+            if cad_vec.shape[1] == 13:
+                if self._cad13_to_cad17_numerical is None:
+                    return None
+                cad_vec = self._cad13_to_cad17_numerical(cad_vec)
+            elif cad_vec.shape[1] != 17:
+                return None
+
             # 转换为 CAD 实体
-            shape = self._vec2CADsolid(cad_vec.astype(np.float32))
+            shape = self._vec2CADsolid(cad_vec.astype(np.float32), is_numerical=True, n=256)
             if shape is None:
                 return None
 

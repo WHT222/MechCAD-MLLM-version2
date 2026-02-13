@@ -16,13 +16,16 @@ if project_root not in sys.path:
     sys.path.append(project_root)
 
 from cadlib.macro import *
+from src.unified_vocab.converter import convert_13d_to_unified_tokens
 
 class OmniCADDataset(Dataset):
     """
     为 Omni-CAD 设计的多模态数据集，能够加载 CAD 向量序列、文本描述和8个视图的图像。
+    支持多视图融合：从8个视图中随机选择指定数量的视图。
     """
     def __init__(self, cad_vec_dir, text_dir, image_dir, split='all', sample_limit=None,
-                 category_start=0, category_end=None, text_only=False):
+                 category_start=0, category_end=None, text_only=False,
+                 num_selected_views=2, random_select_views=True):
         """
         初始化 Omni-CAD 数据集。
 
@@ -35,6 +38,8 @@ class OmniCADDataset(Dataset):
             category_start (int): 起始类别编号 (默认0，即'0000').
             category_end (int, optional): 结束类别编号 (包含)。None表示加载所有可用类别。
             text_only (bool): 仅使用文本模态，跳过图像加载（第一阶段训练）。
+            num_selected_views (int): 多视图融合时选择的视图数量 (默认2)。
+            random_select_views (bool): 是否随机选择视图 (训练时True，推理时False)。
         """
         self.cad_vec_dir = cad_vec_dir
         self.text_dir = text_dir
@@ -45,6 +50,8 @@ class OmniCADDataset(Dataset):
         self.category_end = category_end
         self.text_only = text_only
         self.num_views = 8
+        self.num_selected_views = num_selected_views
+        self.random_select_views = random_select_views
 
         self.samples = []
         self._load_samples()
@@ -192,20 +199,32 @@ class OmniCADDataset(Dataset):
             cad_tensor = torch.from_numpy(padded_cad_vec).long()
         except Exception as e:
             print(f"警告: 无法加载或处理h5文件 {h5_path}: {e}")
-            # 返回一个表示错误的空Tensor
-            cad_tensor = torch.full((MAX_TOTAL_LEN, 13), EOS_IDX, dtype=torch.long)
+            # 返回一个表示错误的空Tensor，并确保后续转换使用一致的兜底数组
+            padded_cad_vec = np.full((MAX_TOTAL_LEN, 13), EOS_IDX, dtype=np.int32)
+            cad_tensor = torch.from_numpy(padded_cad_vec).long()
 
         # 2. 加载文本描述
         text_caption = self.text_captions.get(sample_id, "No description available.")
 
-        # 3. 加载8个视图的图像（text_only模式下跳过）
+        # 3. 加载视图图像（text_only模式下跳过）
         if self.text_only:
             # 纯文本模式：返回占位tensor，不实际加载图像
-            images_stacked = torch.zeros(self.num_views, 3, 224, 224)
+            images_stacked = torch.zeros(self.num_selected_views, 3, 224, 224)
+            selected_view_indices = torch.zeros(self.num_selected_views, dtype=torch.long)
         else:
+            # 随机选择视图索引
+            if self.random_select_views:
+                selected_indices = np.random.choice(
+                    self.num_views, self.num_selected_views, replace=False
+                )
+                selected_indices = np.sort(selected_indices)  # 保持顺序一致性
+            else:
+                # 固定选择前 num_selected_views 个视图（用于推理）
+                selected_indices = np.arange(self.num_selected_views)
+
             # 图像路径格式: step_img/{category}/{filename}_{view:03d}.png
             image_tensors = []
-            for i in range(self.num_views):
+            for i in selected_indices:
                 img_path = os.path.join(self.image_dir, category, f"{filename}_{i:03d}.png")
                 try:
                     if os.path.exists(img_path):
@@ -218,17 +237,26 @@ class OmniCADDataset(Dataset):
                     print(f"警告: 无法加载或处理图片 {img_path}: {e}")
                     image_tensors.append(torch.zeros(3, 224, 224))
 
-            # 如果一张图片都加载失败，则返回8个黑色图片
+            # 如果一张图片都加载失败，则返回占位图片
             if not image_tensors:
-                 image_tensors = [torch.zeros(3, 224, 224) for _ in range(self.num_views)]
+                 image_tensors = [torch.zeros(3, 224, 224) for _ in range(self.num_selected_views)]
 
-            images_stacked = torch.stack(image_tensors) # 堆叠成 (8, C, H, W)
+            images_stacked = torch.stack(image_tensors)  # 堆叠成 (num_selected_views, C, H, W)
+            selected_view_indices = torch.from_numpy(selected_indices).long()
+
+        # 4. 转换为统一词表格式
+        commands, args_tokens = convert_13d_to_unified_tokens(padded_cad_vec)
+        commands_tensor = torch.from_numpy(commands).long()
+        args_tokens_tensor = torch.from_numpy(args_tokens).long()
 
         return {
             'id': sample_id,
             'cad_sequence': cad_tensor,
+            'commands': commands_tensor,
+            'args_tokens': args_tokens_tensor,
             'text_caption': text_caption,
-            'images': images_stacked
+            'images': images_stacked,
+            'view_indices': selected_view_indices  # 选中的视图索引
         }
 
 

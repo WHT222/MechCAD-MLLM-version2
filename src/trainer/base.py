@@ -95,8 +95,15 @@ class BaseTrainer(object):
 
     def update_network(self, loss_dict):
         """通过反向传播更新网络"""
-        # loss = sum(value for sub_dict in loss_dict.values() for value in sub_dict.values())
-        loss = sum(loss_dict.values())
+        # 统一约定: 若提供总损失键 'loss'，则只对总损失反向传播。
+        # 回退逻辑仅用于兼容旧调用方。
+        if isinstance(loss_dict, dict):
+            if 'loss' in loss_dict:
+                loss = loss_dict['loss']
+            else:
+                loss = sum(loss_dict.values())
+        else:
+            loss = loss_dict
         self.optimizer.zero_grad()
         loss.backward()#type: ignore
         if self.cfg.grad_clip is not None:
@@ -171,3 +178,9 @@ class TrainClock(object):
         self.epoch = clock_dict['epoch']
         self.minibatch = clock_dict['minibatch']
         self.step = clock_dict['step']
+
+    def reset(self):
+        """重置训练计数器（跨阶段训练时使用）"""
+        self.epoch = 1
+        self.minibatch = 0
+        self.step = 0

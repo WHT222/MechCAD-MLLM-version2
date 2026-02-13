@@ -12,10 +12,11 @@ if project_root not in sys.path:
     sys.path.append(project_root)
 
 from src.model.model import MechCADModel, MechCADConfig
-from src.trainer.loss import CADLoss
-from src.trainer.scheduler import GradualWarmupScheduler
+from src.trainer.loss import CADLoss, UnifiedCADLoss
+from src.trainer.scheduler import GradualWarmupScheduler, CosineAnnealingWarmupScheduler
 from src.trainer.base import BaseTrainer, TrainClock
 from src.utils.chamfer_distance import ChamferDistanceEvaluator
+from src.utils.mesh_metrics import SegEDangELEvaluator
 from cadlib.macro import *
 
 
@@ -52,6 +53,12 @@ class MechCADTrainer(BaseTrainer):
         self.batch_size = cfg.batch_size
         self.text_only = getattr(cfg, 'text_only', False)
 
+        # 混合精度训练
+        self.use_amp = getattr(cfg, 'use_amp', True)
+        if self.use_amp:
+            self.scaler = torch.cuda.amp.GradScaler()
+            print("启用混合精度训练 (AMP)")
+
         # 确保目录存在
         os.makedirs(self.log_dir, exist_ok=True)
         os.makedirs(self.model_dir, exist_ok=True)
@@ -87,9 +94,18 @@ class MechCADTrainer(BaseTrainer):
 
         llava_path = getattr(cfg, 'llava_model_name', 'model_weights/llava-hf/llava-1.5-7b-hf')
 
+        # 多视图融合参数
+        num_views = getattr(cfg, 'num_selected_views', 2)
+        n_latents = getattr(cfg, 'n_latents', 64)
+
         print("正在初始化 MechCADModel...")
-        self.net = MechCADModel(model_cfg, llava_model_name=llava_path)
-        print("模型初始化完成。")
+        self.net = MechCADModel(
+            model_cfg,
+            llava_model_name=llava_path,
+            num_views=num_views,
+            n_latents=n_latents
+        )
+        print(f"模型初始化完成。(num_views={num_views}, n_latents={n_latents})")
 
         # 统计可训练参数
         trainable_params = sum(p.numel() for p in self.net.parameters() if p.requires_grad)
@@ -101,21 +117,42 @@ class MechCADTrainer(BaseTrainer):
     def set_loss_function(self):
         """设置损失函数"""
         loss_weights = getattr(self.cfg, 'loss_weights', None)
-        self.loss_func = CADLoss(self.model_cfg, weights=loss_weights)
+        # 使用统一词表损失函数
+        self.loss_func = UnifiedCADLoss(self.model_cfg, weights=loss_weights)
 
     def set_optimizer(self, cfg):
         """设置优化器和学习率调度器"""
-        # 仅优化解码器参数 (LLaVA 编码器已冻结)
-        decoder_params = self.net.llm2cad_decoder.parameters()
+        # 优化解码器和多视图融合模块的参数 (LLaVA 编码器已冻结)
+        trainable_params = list(self.net.llm2cad_decoder.parameters())
+
+        # 如果不是纯文本模式，添加多视图融合模块参数
+        if not self.text_only:
+            trainable_params += list(self.net.multiview_fusion.parameters())
 
         self.optimizer = optim.AdamW(
-            decoder_params,
+            trainable_params,
             lr=cfg.lr,
             weight_decay=getattr(cfg, 'weight_decay', 0.01)
         )
 
-        warmup_steps = getattr(cfg, 'warmup_step', 1000)
-        self.scheduler = GradualWarmupScheduler(self.optimizer, 1.0, warmup_steps)
+        # 学习率调度器: Warmup + Cosine Decay
+        warmup_steps = getattr(cfg, 'warmup_step', 500)
+        total_steps = getattr(cfg, 'total_steps', None)
+
+        if total_steps is not None:
+            # 使用 Warmup + Cosine Decay
+            min_lr = getattr(cfg, 'min_lr', cfg.lr * 0.01)
+            self.scheduler = CosineAnnealingWarmupScheduler(
+                self.optimizer,
+                warmup_steps=warmup_steps,
+                total_steps=total_steps,
+                min_lr=min_lr
+            )
+            print(f"学习率调度: Warmup({warmup_steps}步) + Cosine Decay → {min_lr:.2e}")
+        else:
+            # 仅使用 Warmup（向后兼容）
+            self.scheduler = GradualWarmupScheduler(self.optimizer, 1.0, warmup_steps)
+            print(f"学习率调度: Warmup({warmup_steps}步)，无衰减")
 
     def forward(self, data):
         """
@@ -272,14 +309,11 @@ class MechCADTrainer(BaseTrainer):
     def _compute_cmd_accuracy(self, outputs, data):
         """计算命令预测准确率"""
         device = outputs['command_logits'].device
-        cad_seq = data['cad_sequence'].to(device)
-        tgt_commands = cad_seq[:, :, 0]
+        tgt_commands = data['commands'].to(device)
 
         pred_commands = outputs['command_logits'].argmax(dim=-1)
 
         # 有效掩码
-        valid_mask = (tgt_commands != EOS_IDX).float()
-        # 包含第一个 EOS
         eos_cumsum = (tgt_commands == EOS_IDX).cumsum(dim=-1)
         valid_mask = (eos_cumsum <= 1).float()
 
@@ -341,7 +375,9 @@ class MechCADTrainer(BaseTrainer):
                 eval_mask = cmd_match & valid_mask
 
                 if eval_mask.sum() > 0:
-                    pred_args = outputs['args_logits'].argmax(dim=-1) - 1
+                    # 统一词表版本: 先解码为13维CAD向量，再计算参数误差
+                    pred_vec_t = torch.from_numpy(pred_vec).to(device)
+                    pred_args = pred_vec_t[:, :, 1:]
                     gt_args = cad_seq[:, :, 1:]
                     args_diff = torch.abs(pred_args - gt_args).float()
                     total_args_error += (args_diff * eval_mask.unsqueeze(-1)).sum().item()
@@ -364,28 +400,60 @@ class MechCADTrainer(BaseTrainer):
             'num_samples': sample_count
         }
 
-        # 计算 Chamfer Distance (几何相似度)
-        print("\n计算 Chamfer Distance...")
+        # 计算几何指标 (Chamfer / SegE / DangEL)
+        print("\n计算几何指标 (Chamfer / SegE / DangEL)...")
         try:
-            cd_evaluator = ChamferDistanceEvaluator(n_points=2048, normalize=True)
+            if len(all_pred_vecs) == 0 or len(all_gt_vecs) == 0:
+                raise ValueError("无可用样本用于几何评估")
+
             # 合并所有预测和真实向量
             all_pred = np.concatenate(all_pred_vecs, axis=0)
             all_gt = np.concatenate(all_gt_vecs, axis=0)
+            geom_eval_count = min(100, len(all_pred), len(all_gt))  # 限制数量避免评估过慢
 
+            eval_pred_list = [all_pred[i] for i in range(geom_eval_count)]
+            eval_gt_list = [all_gt[i] for i in range(geom_eval_count)]
+
+            cd_evaluator = ChamferDistanceEvaluator(n_points=2048, normalize=True)
             cd_metrics = cd_evaluator.evaluate(
-                [all_pred[i] for i in range(min(100, len(all_pred)))],  # 限制数量避免太慢
-                [all_gt[i] for i in range(min(100, len(all_gt)))]
+                eval_pred_list,
+                eval_gt_list
             )
 
             metrics['chamfer_distance'] = cd_metrics['chamfer_distance']
             metrics['chamfer_valid_count'] = cd_metrics['valid_count']
             metrics['chamfer_failed_count'] = cd_metrics['failed_count']
 
-            print(f"[Chamfer Distance] CD: {cd_metrics['chamfer_distance']:.6f}, "
-                  f"有效: {cd_metrics['valid_count']}, 失败: {cd_metrics['failed_count']}")
+            seg_dangel_evaluator = SegEDangELEvaluator()
+            topo_metrics = seg_dangel_evaluator.evaluate(eval_pred_list, eval_gt_list)
+            metrics['sege'] = topo_metrics['sege']
+            metrics['sege_rel'] = topo_metrics['sege_rel']
+            metrics['dangel'] = topo_metrics['dangel']
+            metrics['dangel_norm'] = topo_metrics['dangel_norm']
+            metrics['mesh_valid_count'] = topo_metrics['valid_count']
+            metrics['mesh_failed_count'] = topo_metrics['failed_count']
+
+            print(
+                f"[Chamfer] CD: {cd_metrics['chamfer_distance']:.6f}, "
+                f"有效: {cd_metrics['valid_count']}, 失败: {cd_metrics['failed_count']}"
+            )
+            print(
+                f"[SegE/DangEL] SegE: {topo_metrics['sege']:.4f}, "
+                f"DangEL: {topo_metrics['dangel']:.4f}, "
+                f"DangEL(norm): {topo_metrics['dangel_norm']:.6f}, "
+                f"有效: {topo_metrics['valid_count']}, 失败: {topo_metrics['failed_count']}"
+            )
         except Exception as e:
-            print(f"Chamfer Distance 计算失败: {e}")
+            print(f"几何指标计算失败: {e}")
             metrics['chamfer_distance'] = -1.0
+            metrics['chamfer_valid_count'] = 0
+            metrics['chamfer_failed_count'] = 0
+            metrics['sege'] = -1.0
+            metrics['sege_rel'] = -1.0
+            metrics['dangel'] = -1.0
+            metrics['dangel_norm'] = -1.0
+            metrics['mesh_valid_count'] = 0
+            metrics['mesh_failed_count'] = 0
 
         print(f"\n[Evaluate] 命令准确率: {cmd_accuracy*100:.2f}%, 参数MAE: {args_mae:.4f}")
 
@@ -393,58 +461,53 @@ class MechCADTrainer(BaseTrainer):
         if self.use_tensorboard:
             self.val_tb.add_scalar('eval/cmd_accuracy', cmd_accuracy, self.clock.epoch)
             self.val_tb.add_scalar('eval/args_mae', args_mae, self.clock.epoch)
+            if 'chamfer_distance' in metrics:
+                self.val_tb.add_scalar('eval/chamfer_distance', metrics['chamfer_distance'], self.clock.epoch)
+            if 'sege' in metrics:
+                self.val_tb.add_scalar('eval/sege', metrics['sege'], self.clock.epoch)
+            if 'dangel' in metrics:
+                self.val_tb.add_scalar('eval/dangel', metrics['dangel'], self.clock.epoch)
+            if 'dangel_norm' in metrics:
+                self.val_tb.add_scalar('eval/dangel_norm', metrics['dangel_norm'], self.clock.epoch)
 
         return metrics
 
     def logits2vec(self, outputs, refill_pad=True):
         """
-        将模型输出转换为 CAD 向量。
+        将模型输出转换为 CAD 向量（统一词表版本）。
 
         Args:
             outputs: 模型输出字典
+                - command_logits: [B, S, n_commands]
+                - unified_args_logits: [B, S, MAX_ARGS_PER_CMD, VOCAB_SIZE]
             refill_pad: 是否将未使用的参数填充为 -1
 
         Returns:
             cad_vec: [B, S, 13] numpy 数组
         """
+        from src.unified_vocab.converter import unified_tokens_to_13d
+
         cmd_logits = outputs['command_logits']
-        args_logits = outputs['args_logits']
-        angle_logits = outputs['angle_logits']
-        pos_logits = outputs['pos_logits']
+        unified_args_logits = outputs['unified_args_logits']
 
         # 命令预测
         pred_commands = cmd_logits.argmax(dim=-1)  # [B, S]
 
-        # 参数预测 (减1恢复原始范围)
-        pred_args = args_logits.argmax(dim=-1) - 1  # [B, S, 12]
+        # 参数token预测
+        pred_args_tokens = unified_args_logits.argmax(dim=-1)  # [B, S, MAX_ARGS_PER_CMD]
 
-        # 角度和位置 Token 预测
-        pred_angle = angle_logits.argmax(dim=-1)  # [B, S]
-        pred_pos = pos_logits.argmax(dim=-1)  # [B, S]
+        # 转换为numpy
+        pred_commands_np = pred_commands.detach().cpu().numpy()
+        pred_args_tokens_np = pred_args_tokens.detach().cpu().numpy()
 
-        # 对于 Ext 命令，用 token 预测覆盖对应参数位置
-        ext_mask = (pred_commands == EXT_IDX)
-        pred_args[:, :, 5] = torch.where(ext_mask, pred_angle, pred_args[:, :, 5])
-        pred_args[:, :, 6] = torch.where(ext_mask, pred_pos, pred_args[:, :, 6])
+        # 批量转换为13维CAD向量
+        B, S = pred_commands_np.shape
+        cad_vecs = []
+        for b in range(B):
+            cad_vec = unified_tokens_to_13d(pred_commands_np[b], pred_args_tokens_np[b])
+            cad_vecs.append(cad_vec)
 
-        if refill_pad:
-            # 根据命令类型填充未使用的参数为 -1
-            # 适配13D向量的命令-参数掩码 (12个参数)
-            cmd_args_mask_13d = torch.tensor([
-                [1, 1, 0, 0, 0,  0, 0,  0, 0, 0, 0, 0],  # Line: x, y
-                [1, 1, 1, 1, 0,  0, 0,  0, 0, 0, 0, 0],  # Arc: x, y, alpha, f
-                [1, 1, 0, 0, 1,  0, 0,  0, 0, 0, 0, 0],  # Circle: x, y, r
-                [0, 0, 0, 0, 0,  0, 0,  0, 0, 0, 0, 0],  # EOS: 无参数
-                [0, 0, 0, 0, 0,  0, 0,  0, 0, 0, 0, 0],  # SOL: 无参数
-                [0, 0, 0, 0, 0,  1, 1,  1, 1, 1, 1, 1],  # Ext: angle, pos, e1-e2-b-u-s
-            ], dtype=torch.float32, device=pred_commands.device)
-            mask = cmd_args_mask_13d[pred_commands.long()]  # [B, S, 12]
-            pred_args = torch.where(mask.bool(), pred_args, torch.tensor(-1, device=pred_args.device))
-
-        # 组合为 13 维向量
-        cad_vec = torch.cat([pred_commands.unsqueeze(-1), pred_args], dim=-1)
-
-        return cad_vec.detach().cpu().numpy()
+        return np.stack(cad_vecs, axis=0)  # [B, S, 13]
 
     def save_ckpt(self, name=None):
         """保存检查点"""
@@ -454,20 +517,27 @@ class MechCADTrainer(BaseTrainer):
         else:
             save_path = os.path.join(self.model_dir, f"{name}.pth")
 
-        # 仅保存解码器权重 (LLaVA 太大且已冻结)
+        # 仅保存可训练模块权重 (LLaVA 太大且已冻结)
         decoder_state = self.net.llm2cad_decoder.cpu().state_dict()
-
-        torch.save({
+        checkpoint_dict = {
             'clock': self.clock.make_checkpoint(),
             'decoder_state_dict': decoder_state,
             'optimizer_state_dict': self.optimizer.state_dict(),
             'scheduler_state_dict': self.scheduler.state_dict(),
             'model_cfg': self.model_cfg
-        }, save_path)
+        }
+
+        # 多模态阶段额外保存融合模块权重
+        if not self.text_only:
+            fusion_state = self.net.multiview_fusion.cpu().state_dict()
+            checkpoint_dict['fusion_state_dict'] = fusion_state
+
+        torch.save(checkpoint_dict, save_path)
 
         # 移回 GPU
         device = next(self.net.llava_model.parameters()).device
         self.net.llm2cad_decoder.to(device)
+        self.net.multiview_fusion.to(device)
 
         print(f"检查点已保存到: {save_path}")
 
@@ -480,10 +550,15 @@ class MechCADTrainer(BaseTrainer):
                 raise FileNotFoundError(f"未找到检查点: {self.model_dir}")
             ckpts.sort(key=lambda x: int(x.split('epoch')[1].split('.')[0]))
             name = ckpts[-1].replace('.pth', '')
-
-        load_path = os.path.join(self.model_dir, f"{name}.pth")
-        if not os.path.exists(load_path):
-            load_path = os.path.join(self.model_dir, name)
+            load_path = os.path.join(self.model_dir, f"{name}.pth")
+        elif os.path.isabs(name) or os.path.exists(name):
+            # 如果是绝对路径或已存在的路径，直接使用
+            load_path = name
+        else:
+            # 相对于 model_dir 的路径
+            load_path = os.path.join(self.model_dir, f"{name}.pth")
+            if not os.path.exists(load_path):
+                load_path = os.path.join(self.model_dir, name)
 
         if not os.path.exists(load_path):
             raise FileNotFoundError(f"检查点不存在: {load_path}")
@@ -492,10 +567,43 @@ class MechCADTrainer(BaseTrainer):
         # weights_only=False 用于加载包含自定义类 (MechCADConfig) 的检查点
         checkpoint = torch.load(load_path, map_location='cpu', weights_only=False)
 
+        # 加载模型权重
         self.net.llm2cad_decoder.load_state_dict(checkpoint['decoder_state_dict'])
-        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-        self.clock.restore_checkpoint(checkpoint['clock'])
+
+        # 如果有多视图融合权重，也加载
+        if 'fusion_state_dict' in checkpoint:
+            self.net.multiview_fusion.load_state_dict(checkpoint['fusion_state_dict'])
+
+        # 是否恢复优化器和调度器状态（跨阶段训练时需要重置）
+        reset_scheduler = getattr(self.cfg, 'reset_scheduler', False)
+
+        if not reset_scheduler:
+            try:
+                # 检查优化器参数组是否匹配
+                saved_param_count = sum(
+                    len(g['params']) for g in checkpoint['optimizer_state_dict']['param_groups']
+                )
+                current_param_count = sum(
+                    len(list(g['params'])) for g in self.optimizer.param_groups
+                )
+
+                if saved_param_count != current_param_count:
+                    print(f"警告: 优化器参数组大小不匹配 (保存:{saved_param_count} vs 当前:{current_param_count})")
+                    print("跨阶段训练时参数组变化，将使用新的优化器和调度器")
+                    reset_scheduler = True
+                else:
+                    self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+                    self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+                    self.clock.restore_checkpoint(checkpoint['clock'])
+                    print("已恢复优化器和调度器状态")
+            except Exception as e:
+                print(f"警告: 无法恢复优化器/调度器状态 ({e})")
+                print("将使用新的调度器")
+                reset_scheduler = True
+
+        if reset_scheduler:
+            print("学习率调度器已重置（从新的 warmup 开始）")
+            self.clock.reset()  # 重置训练计数器
 
         # 移到正确设备
         device = next(self.net.llava_model.parameters()).device

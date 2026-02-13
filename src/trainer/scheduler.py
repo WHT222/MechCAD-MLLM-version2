@@ -1,5 +1,46 @@
+import math
 from torch.optim.lr_scheduler import _LRScheduler
 from torch.optim.lr_scheduler import ReduceLROnPlateau
+
+
+class CosineAnnealingWarmupScheduler(_LRScheduler):
+    """
+    Warmup + Cosine Annealing 学习率调度器。
+
+    学习率变化曲线:
+    1. Warmup阶段: lr 从 0 线性增长到 base_lr
+    2. Cosine阶段: lr 从 base_lr 余弦衰减到 min_lr
+
+    Args:
+        optimizer: 优化器
+        warmup_steps: 预热步数
+        total_steps: 总训练步数
+        min_lr: 最小学习率 (默认为 base_lr 的 1%)
+    """
+
+    def __init__(self, optimizer, warmup_steps, total_steps, min_lr=None):
+        self.warmup_steps = warmup_steps
+        self.total_steps = total_steps
+        self.min_lr = min_lr
+        super().__init__(optimizer)
+
+    def get_lr(self):
+        if self.last_epoch < self.warmup_steps:
+            # Warmup 阶段: 线性增长
+            warmup_factor = self.last_epoch / max(1, self.warmup_steps)
+            return [base_lr * warmup_factor for base_lr in self.base_lrs]
+        else:
+            # Cosine Decay 阶段
+            progress = (self.last_epoch - self.warmup_steps) / max(1, self.total_steps - self.warmup_steps)
+            progress = min(progress, 1.0)  # 确保不超过 1
+
+            lrs = []
+            for base_lr in self.base_lrs:
+                min_lr = self.min_lr if self.min_lr is not None else base_lr * 0.01
+                # 余弦衰减公式: min_lr + 0.5 * (base_lr - min_lr) * (1 + cos(π * progress))
+                lr = min_lr + 0.5 * (base_lr - min_lr) * (1 + math.cos(math.pi * progress))
+                lrs.append(lr)
+            return lrs
 
 
 class GradualWarmupScheduler(_LRScheduler):
