@@ -18,6 +18,8 @@ if project_root not in sys.path:
 from cadlib.macro import *
 from src.unified_vocab.converter import convert_13d_to_unified_tokens
 
+CLEAN_CACHE_VERSION = 3
+
 class OmniCADDataset(Dataset):
     """
     为 Omni-CAD 设计的多模态数据集，能够加载 CAD 向量序列、文本描述和8个视图的图像。
@@ -26,7 +28,7 @@ class OmniCADDataset(Dataset):
     def __init__(self, cad_vec_dir, text_dir, image_dir, split='all', sample_limit=None,
                  category_start=0, category_end=None, text_only=False,
                  num_selected_views=2, random_select_views=True,
-                 clean_invalid_samples=False, clean_cache_path=None, clean_with_occ=True):
+                 clean_mode='off', clean_cache_path=None):
         """
         初始化 Omni-CAD 数据集。
 
@@ -41,9 +43,12 @@ class OmniCADDataset(Dataset):
             text_only (bool): 仅使用文本模态，跳过图像加载（第一阶段训练）。
             num_selected_views (int): 多视图融合时选择的视图数量 (默认2)。
             random_select_views (bool): 是否随机选择视图 (训练时True，推理时False)。
-            clean_invalid_samples (bool): 是否在加载阶段过滤非法样本。
+            clean_mode (str): 样本清洗模式:
+                - 'off': 不清洗
+                - 'basic': 仅做基础规则检查（不调用 OCC）
+                - 'occ': 可构建 OCC 几何即通过（推荐）
+                - 'occ_strict': 额外要求 BRepCheck 严格合法
             clean_cache_path (str, optional): 合法性缓存json路径，避免重复检查。
-            clean_with_occ (bool): 清洗时是否使用OpenCascade几何检查。
         """
         self.cad_vec_dir = cad_vec_dir
         self.text_dir = text_dir
@@ -56,16 +61,24 @@ class OmniCADDataset(Dataset):
         self.num_views = 8
         self.num_selected_views = num_selected_views
         self.random_select_views = random_select_views
-        self.clean_invalid_samples = clean_invalid_samples
+        self.clean_mode = str(clean_mode).strip().lower()
+        valid_clean_modes = {'off', 'basic', 'occ', 'occ_strict'}
+        if self.clean_mode not in valid_clean_modes:
+            raise ValueError(
+                f"未知 clean_mode='{self.clean_mode}'，可选: {sorted(valid_clean_modes)}"
+            )
+
+        self.clean_enabled = self.clean_mode != 'off'
+        self.use_occ_validation = self.clean_mode in {'occ', 'occ_strict'}
+        self.strict_occ_validation = self.clean_mode == 'occ_strict'
         self.clean_cache_path = clean_cache_path
-        self.clean_with_occ = clean_with_occ
         self._occ_validator_ready = False
         self._vec2CADsolid = None
         self._BRepCheck_Analyzer = None
 
         self.samples = []
         self._load_samples()
-        if self.clean_invalid_samples:
+        if self.clean_enabled:
             self._filter_invalid_samples()
 
         self.text_captions = self._load_text_captions()
@@ -131,6 +144,9 @@ class OmniCADDataset(Dataset):
             with open(self.clean_cache_path, 'r', encoding='utf-8') as f:
                 data = json.load(f)
             if isinstance(data, dict):
+                # 兼容历史格式（直接 dict）和新格式（带 version/entries）
+                if "entries" in data and isinstance(data["entries"], dict):
+                    return data["entries"]
                 return data
         except Exception as e:
             print(f"警告: 读取清洗缓存失败 {self.clean_cache_path}: {e}")
@@ -143,15 +159,24 @@ class OmniCADDataset(Dataset):
             cache_dir = os.path.dirname(self.clean_cache_path)
             if cache_dir:
                 os.makedirs(cache_dir, exist_ok=True)
+            payload = {
+                "version": CLEAN_CACHE_VERSION,
+                "entries": cache
+            }
             with open(self.clean_cache_path, 'w', encoding='utf-8') as f:
-                json.dump(cache, f, ensure_ascii=False, indent=2)
+                json.dump(payload, f, ensure_ascii=False, indent=2)
         except Exception as e:
             print(f"警告: 写入清洗缓存失败 {self.clean_cache_path}: {e}")
+
+    def _cache_key(self, sample_id):
+        return (
+            f"v{CLEAN_CACHE_VERSION}|mode={self.clean_mode}|{sample_id}"
+        )
 
     def _init_occ_validator(self):
         if self._occ_validator_ready:
             return True
-        if not self.clean_with_occ:
+        if not self.use_occ_validation:
             return False
         try:
             from cadlib.visualize import vec2CADsolid
@@ -162,7 +187,7 @@ class OmniCADDataset(Dataset):
             return True
         except Exception as e:
             print(f"警告: OCC清洗不可用，降级为基础规则过滤: {e}")
-            self.clean_with_occ = False
+            self.use_occ_validation = False
             return False
 
     def _is_sample_valid(self, h5_path):
@@ -177,21 +202,47 @@ class OmniCADDataset(Dataset):
         if cad_vec_17d.ndim != 2 or cad_vec_17d.shape[1] != 17:
             return False
 
-        # 基础规则：命令索引合法
-        cmds = cad_vec_17d[:, 0]
-        if np.any((cmds < 0) | (cmds > EXT_IDX)):
+        # 基础规则：命令索引合法（允许 PAD=-1）
+        cmds = cad_vec_17d[:, 0].astype(np.int32)
+        valid_cmds = {PAD_VAL, LINE_IDX, ARC_IDX, CIRCLE_IDX, EOS_IDX, SOL_IDX, EXT_IDX}
+        if np.any([int(c) not in valid_cmds for c in cmds]):
+            return False
+
+        # 去掉 PAD 尾部，截断到第一个 EOS（含EOS）
+        non_pad = cmds != PAD_VAL
+        vec = cad_vec_17d[non_pad]
+        if vec.shape[0] == 0:
+            return False
+
+        eos_positions = np.where(vec[:, 0].astype(np.int32) == EOS_IDX)[0]
+        if len(eos_positions) > 0:
+            vec = vec[:int(eos_positions[0]) + 1]
+
+        # 至少包含一个可执行几何命令
+        geom_cmd_mask = np.isin(vec[:, 0].astype(np.int32), [LINE_IDX, ARC_IDX, CIRCLE_IDX, EXT_IDX])
+        if not np.any(geom_cmd_mask):
             return False
 
         # 可选 OCC 几何合法性检查
-        if not self.clean_with_occ:
+        if not self.use_occ_validation:
             return True
         if not self._init_occ_validator():
             return True
 
         try:
-            shape = self._vec2CADsolid(cad_vec_17d.astype(np.float32), is_numerical=True, n=256)  # type: ignore
+            shape = self._vec2CADsolid(vec.astype(np.float32), is_numerical=True, n=256)  # type: ignore
             if shape is None:
                 return False
+            try:
+                if hasattr(shape, "IsNull") and shape.IsNull():  # type: ignore[attr-defined]
+                    return False
+            except Exception:
+                pass
+
+            # 默认使用宽松规则：可构建几何即可通过
+            if not self.strict_occ_validation:
+                return True
+
             analyzer = self._BRepCheck_Analyzer(shape)  # type: ignore
             return bool(analyzer.IsValid())
         except Exception:
@@ -209,7 +260,7 @@ class OmniCADDataset(Dataset):
         updated_cache = False
         for sample in tqdm(self.samples, desc="清洗样本", leave=False):
             sample_id = sample['id']
-            key = sample_id
+            key = self._cache_key(sample_id)
             if key in cache:
                 is_valid = bool(cache[key])
             else:

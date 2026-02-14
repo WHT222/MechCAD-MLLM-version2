@@ -70,9 +70,8 @@ class TrainConfig:
     num_workers: int = 4
     category_start: int = 0  # 起始类别 (0000)
     category_end: Optional[int] = None  # 结束类别 (None表示全部)
-    clean_invalid_samples: bool = False
+    clean_mode: str = "off"  # off|basic|occ|occ_strict
     clean_cache_path: Optional[str] = None
-    clean_with_occ: bool = True
 
     # 保存策略
     save_every: int = 5
@@ -168,12 +167,11 @@ def parse_args():
                         help="起始类别编号 (默认0，即0000)")
     parser.add_argument("--category_end", type=int, default=None,
                         help="结束类别编号 (包含)，如 --category_end 9 表示加载0000-0009")
-    parser.add_argument("--clean_invalid_samples", action="store_true",
-                        help="数据集预处理阶段过滤非法样本")
+    parser.add_argument("--clean_mode", type=str, default="off",
+                        choices=["off", "basic", "occ", "occ_strict"],
+                        help="样本清洗模式: off|basic|occ|occ_strict")
     parser.add_argument("--clean_cache_path", type=str, default=None,
                         help="清洗缓存json路径（避免重复OCC检查）")
-    parser.add_argument("--no_clean_with_occ", action="store_true",
-                        help="清洗时不使用OCC，仅基础规则过滤")
 
     # 保存
     parser.add_argument("--save_every", type=int, default=5)
@@ -251,9 +249,8 @@ def main():
         num_workers=args.num_workers,
         category_start=args.category_start,
         category_end=args.category_end,
-        clean_invalid_samples=args.clean_invalid_samples,
+        clean_mode=args.clean_mode,
         clean_cache_path=args.clean_cache_path,
-        clean_with_occ=not args.no_clean_with_occ,
         save_every=args.save_every,
         eval_every=args.eval_every,
         full_eval_every=args.full_eval_every,
@@ -288,9 +285,9 @@ def main():
         )
     else:
         print("几何软目标: off")
-    if cfg.clean_invalid_samples:
+    if cfg.clean_mode != "off":
         print(
-            f"数据清洗: on (occ={'on' if cfg.clean_with_occ else 'off'}, "
+            f"数据清洗: on (mode={cfg.clean_mode}, "
             f"cache={cfg.clean_cache_path if cfg.clean_cache_path else 'none'})"
         )
     print(f"Epochs: {cfg.epochs}")
@@ -317,16 +314,28 @@ def main():
         category_end=cfg.category_end,
         text_only=cfg.text_only,
         num_selected_views=cfg.num_selected_views,
-        clean_invalid_samples=cfg.clean_invalid_samples,
+        clean_mode=cfg.clean_mode,
         clean_cache_path=cfg.clean_cache_path,
-        clean_with_occ=cfg.clean_with_occ,
     )
 
     # 划分训练/验证/测试集 (三集划分)
     total_size = len(full_dataset)
+    if total_size == 0:
+        raise ValueError(
+            "数据集为空 (total_size=0)。请检查: "
+            f"cad_vec_dir={cfg.cad_vec_dir}, category_range=[{cfg.category_start}, {cfg.category_end}], "
+            f"clean_mode={cfg.clean_mode}, clean_cache_path={cfg.clean_cache_path}. "
+            "若开启了数据清洗，可能所有样本被过滤。"
+        )
+
     test_size = int(total_size * cfg.test_split)
     val_size = int(total_size * cfg.val_split)
     train_size = total_size - val_size - test_size
+    if train_size <= 0:
+        raise ValueError(
+            f"无有效训练样本: total={total_size}, train={train_size}, val={val_size}, test={test_size}. "
+            "请减小 val_split/test_split 或扩大数据范围。"
+        )
 
     train_dataset, val_dataset, test_dataset = random_split(
         full_dataset, [train_size, val_size, test_size],
@@ -337,6 +346,13 @@ def main():
     print(f"验证集: {len(val_dataset)} 样本 ({100*val_size/total_size:.1f}%)")
     print(f"测试集: {len(test_dataset)} 样本 ({100*test_size/total_size:.1f}%)")
 
+    drop_last_train = len(train_dataset) >= cfg.batch_size
+    if not drop_last_train:
+        print(
+            f"警告: 训练集样本数({len(train_dataset)}) < batch_size({cfg.batch_size})，"
+            "训练集 DataLoader 将使用 drop_last=False。"
+        )
+
     # 创建 DataLoader
     train_loader = DataLoader(
         train_dataset,
@@ -344,7 +360,7 @@ def main():
         shuffle=True,
         num_workers=cfg.num_workers,
         pin_memory=True,
-        drop_last=True
+        drop_last=drop_last_train
     )
 
     val_loader = DataLoader(
@@ -365,6 +381,12 @@ def main():
 
     # 计算 total_steps (用于 Cosine Decay 学习率调度)
     steps_per_epoch = len(train_loader)
+    if steps_per_epoch <= 0:
+        raise ValueError(
+            f"训练 DataLoader 为空: steps_per_epoch={steps_per_epoch}. "
+            f"train_size={len(train_dataset)}, batch_size={cfg.batch_size}, drop_last={drop_last_train}. "
+            "请减小 batch_size 或扩大数据集。"
+        )
     total_steps = cfg.epochs * steps_per_epoch
     cfg.total_steps = total_steps if cfg.use_cosine_decay else None
 
