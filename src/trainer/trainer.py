@@ -72,6 +72,9 @@ class MechCADTrainer(BaseTrainer):
         # 设置优化器
         self.set_optimizer(cfg)
 
+        # 几何软目标配置（训练时启用）
+        self._setup_geometry_guidance(cfg)
+
         # TensorBoard (延迟导入以避免未安装时报错)
         try:
             from tensorboardX import SummaryWriter
@@ -116,9 +119,184 @@ class MechCADTrainer(BaseTrainer):
 
     def set_loss_function(self):
         """设置损失函数"""
-        loss_weights = getattr(self.cfg, 'loss_weights', None)
-        # 使用统一词表损失函数
-        self.loss_func = UnifiedCADLoss(self.model_cfg, weights=loss_weights)
+        raw_loss_weights = getattr(self.cfg, 'loss_weights', None)
+        if isinstance(raw_loss_weights, dict):
+            loss_weights = {
+                'cmd': float(raw_loss_weights.get('cmd', 2.0)),
+                'args': float(raw_loss_weights.get('args', 1.0)),
+            }
+        else:
+            loss_weights = {
+                'cmd': float(getattr(self.cfg, 'loss_cmd_weight', 2.0)),
+                'args': float(getattr(self.cfg, 'loss_args_weight', 1.0)),
+            }
+
+        loss_tolerance = int(getattr(self.cfg, 'loss_tolerance', 3))
+        loss_alpha = float(getattr(self.cfg, 'loss_alpha', 2.0))
+
+        # 使用统一词表损失函数（类型感知参数损失）
+        self.loss_func = UnifiedCADLoss(
+            self.model_cfg,
+            weights=loss_weights,
+            tolerance=loss_tolerance,
+            alpha=loss_alpha
+        )
+        print(
+            f"损失配置: cmd={loss_weights['cmd']:.2f}, args={loss_weights['args']:.2f}, "
+            f"tolerance={loss_tolerance}, alpha={loss_alpha:.2f}"
+        )
+
+    def _setup_geometry_guidance(self, cfg):
+        """初始化几何软目标设置。"""
+        self.enable_geo_soft_loss = bool(getattr(cfg, 'enable_geo_soft_loss', False))
+        self.geo_probe_every = max(int(getattr(cfg, 'geo_probe_every', 100)), 1)
+        self.geo_probe_samples = max(int(getattr(cfg, 'geo_probe_samples', 4)), 1)
+        self.geo_probe_ema = float(np.clip(getattr(cfg, 'geo_probe_ema', 0.8), 0.0, 0.999))
+
+        self.geo_lambda_warmup_ratio = float(
+            np.clip(getattr(cfg, 'geo_lambda_warmup_ratio', 0.3), 0.0, 0.99)
+        )
+        self.geo_lambda_seg_start = float(getattr(cfg, 'geo_lambda_seg_start', 0.0))
+        self.geo_lambda_seg_end = float(getattr(cfg, 'geo_lambda_seg_end', 0.15))
+        self.geo_lambda_dang_start = float(getattr(cfg, 'geo_lambda_dang_start', 0.0))
+        self.geo_lambda_dang_end = float(getattr(cfg, 'geo_lambda_dang_end', 0.15))
+        self.geo_seg_clip = float(getattr(cfg, 'geo_seg_clip', 5.0))
+        self.geo_dang_clip = float(getattr(cfg, 'geo_dang_clip', 5.0))
+
+        self.geo_last_metrics = {
+            'sege_rel': 0.0,
+            'dangel_norm': 0.0,
+            'valid_ratio': 0.0,
+            'valid_count': 0.0,
+            'failed_count': 0.0,
+        }
+
+        self.geo_evaluator = None
+        if not self.enable_geo_soft_loss:
+            return
+
+        self.geo_evaluator = SegEDangELEvaluator()
+        if not getattr(self.geo_evaluator, '_cad_available', False):
+            print("警告: OCC/cadlib 不可用，禁用几何软目标训练")
+            self.enable_geo_soft_loss = False
+            self.geo_evaluator = None
+            return
+
+        print(
+            "启用几何软目标: "
+            f"probe_every={self.geo_probe_every}, probe_samples={self.geo_probe_samples}, "
+            f"lambda_seg=[{self.geo_lambda_seg_start:.3f}->{self.geo_lambda_seg_end:.3f}], "
+            f"lambda_dang=[{self.geo_lambda_dang_start:.3f}->{self.geo_lambda_dang_end:.3f}], "
+            f"warmup_ratio={self.geo_lambda_warmup_ratio:.2f}"
+        )
+
+    def _tensor_scalar(self, value: float, ref_tensor: torch.Tensor) -> torch.Tensor:
+        return torch.tensor(float(value), device=ref_tensor.device, dtype=ref_tensor.dtype)
+
+    def _get_geo_lambdas(self):
+        """按训练进度动态计算 λ_seg 与 λ_dang。"""
+        total_steps = getattr(self.cfg, 'total_steps', None)
+        if total_steps is not None and int(total_steps) > 0:
+            progress = float(np.clip(self.clock.step / float(total_steps), 0.0, 1.0))
+        else:
+            total_epochs = max(int(getattr(self.cfg, 'epochs', 1)), 1)
+            progress = float(np.clip((self.clock.epoch - 1) / float(total_epochs), 0.0, 1.0))
+
+        if progress <= self.geo_lambda_warmup_ratio:
+            phase = 0.0
+        else:
+            phase = (progress - self.geo_lambda_warmup_ratio) / (1.0 - self.geo_lambda_warmup_ratio + 1e-8)
+            phase = float(np.clip(phase, 0.0, 1.0))
+
+        lambda_seg = self.geo_lambda_seg_start + phase * (self.geo_lambda_seg_end - self.geo_lambda_seg_start)
+        lambda_dang = self.geo_lambda_dang_start + phase * (self.geo_lambda_dang_end - self.geo_lambda_dang_start)
+        return float(lambda_seg), float(lambda_dang)
+
+    @torch.no_grad()
+    def _run_geometry_probe(self, outputs, data):
+        """在线几何探针：解析少量样本，更新几何质量统计。"""
+        if (not self.enable_geo_soft_loss) or (self.geo_evaluator is None):
+            return None
+
+        try:
+            pred_vec = self.logits2vec(outputs)
+            gt_vec = data['cad_sequence'].detach().cpu().numpy()
+            n_probe = min(self.geo_probe_samples, pred_vec.shape[0], gt_vec.shape[0])
+            if n_probe <= 0:
+                return None
+
+            pred_list = [pred_vec[i] for i in range(n_probe)]
+            gt_list = [gt_vec[i] for i in range(n_probe)]
+            metrics = self.geo_evaluator.evaluate(pred_list, gt_list)
+
+            valid_count = float(metrics.get('valid_count', 0))
+            failed_count = float(metrics.get('failed_count', n_probe))
+            total_count = max(valid_count + failed_count, 1.0)
+            valid_ratio = valid_count / total_count
+
+            sege_rel = float(metrics.get('sege_rel', -1.0))
+            dangel_norm = float(metrics.get('dangel_norm', -1.0))
+            if sege_rel < 0:
+                sege_rel = self.geo_seg_clip
+            if dangel_norm < 0:
+                dangel_norm = self.geo_dang_clip
+
+            sege_rel = float(np.clip(sege_rel, 0.0, self.geo_seg_clip))
+            dangel_norm = float(np.clip(dangel_norm, 0.0, self.geo_dang_clip))
+
+            m = self.geo_probe_ema
+            self.geo_last_metrics['sege_rel'] = m * self.geo_last_metrics['sege_rel'] + (1.0 - m) * sege_rel
+            self.geo_last_metrics['dangel_norm'] = m * self.geo_last_metrics['dangel_norm'] + (1.0 - m) * dangel_norm
+            self.geo_last_metrics['valid_ratio'] = m * self.geo_last_metrics['valid_ratio'] + (1.0 - m) * valid_ratio
+            self.geo_last_metrics['valid_count'] = valid_count
+            self.geo_last_metrics['failed_count'] = failed_count
+
+            return {
+                'geo_probe_sege_rel': sege_rel,
+                'geo_probe_dangel_norm': dangel_norm,
+                'geo_probe_valid_ratio': valid_ratio,
+                'geo_probe_valid_count': valid_count,
+                'geo_probe_failed_count': failed_count,
+            }
+        except Exception as e:
+            print(f"几何探针失败(step={self.clock.step}): {e}")
+            return None
+
+    def _apply_geometry_guidance(self, loss_dict):
+        """
+        几何软目标引导：
+        使用 stop-gradient 的几何惩罚对 CE 总损失做重加权。
+        """
+        if not self.enable_geo_soft_loss:
+            return loss_dict
+
+        lambda_seg, lambda_dang = self._get_geo_lambdas()
+        sege_rel = float(self.geo_last_metrics['sege_rel'])
+        dangel_norm = float(self.geo_last_metrics['dangel_norm'])
+        valid_ratio = float(self.geo_last_metrics['valid_ratio'])
+
+        loss_ce = loss_dict['loss']
+        lambda_seg_t = self._tensor_scalar(lambda_seg, loss_ce)
+        lambda_dang_t = self._tensor_scalar(lambda_dang, loss_ce)
+        sege_t = self._tensor_scalar(sege_rel, loss_ce)
+        dangel_t = self._tensor_scalar(dangel_norm, loss_ce)
+        valid_ratio_t = self._tensor_scalar(valid_ratio, loss_ce)
+
+        # 几何惩罚（非可微，作为软目标信号）
+        loss_geo = lambda_seg_t * sege_t + lambda_dang_t * dangel_t
+        scaled_loss = loss_ce * (1.0 + loss_geo)
+
+        loss_dict['loss_ce'] = loss_ce
+        loss_dict['loss_geo'] = loss_geo
+        loss_dict['loss_geo_proxy_total'] = loss_ce + loss_geo
+        loss_dict['loss'] = scaled_loss
+
+        loss_dict['lambda_seg'] = lambda_seg_t
+        loss_dict['lambda_dang'] = lambda_dang_t
+        loss_dict['geo_sege_rel'] = sege_t
+        loss_dict['geo_dangel_norm'] = dangel_t
+        loss_dict['geo_valid_ratio'] = valid_ratio_t
+        return loss_dict
 
     def set_optimizer(self, cfg):
         """设置优化器和学习率调度器"""
@@ -202,6 +380,14 @@ class MechCADTrainer(BaseTrainer):
         for batch_idx, data in enumerate(pbar):
             outputs, loss_dict = self.forward(data)
 
+            if self.enable_geo_soft_loss:
+                if (self.clock.step + 1) % self.geo_probe_every == 0:
+                    probe_stats = self._run_geometry_probe(outputs, data)
+                    if probe_stats is not None:
+                        for k, v in probe_stats.items():
+                            loss_dict[k] = self._tensor_scalar(v, loss_dict['loss'])
+                loss_dict = self._apply_geometry_guidance(loss_dict)
+
             # 反向传播
             self.update_network(loss_dict)
 
@@ -217,12 +403,21 @@ class MechCADTrainer(BaseTrainer):
             current_lr = self.optimizer.param_groups[0]['lr']
 
             # 更新进度条
-            pbar.set_postfix({
+            postfix = {
                 'loss': f"{loss_val:.4f}",
                 'cmd': f"{loss_dict['loss_cmd'].item():.4f}",
                 'args': f"{loss_dict['loss_args'].item():.4f}",
                 'lr': f"{current_lr:.2e}"
-            })
+            }
+            if 'cmd_recall_ext' in loss_dict:
+                postfix['ext_r'] = f"{loss_dict['cmd_recall_ext'].item():.3f}"
+            if 'args_acc_param' in loss_dict:
+                postfix['param_a'] = f"{loss_dict['args_acc_param'].item():.3f}"
+            if 'loss_geo' in loss_dict:
+                postfix['geo'] = f"{loss_dict['loss_geo'].item():.3f}"
+            if 'geo_valid_ratio' in loss_dict:
+                postfix['gvr'] = f"{loss_dict['geo_valid_ratio'].item():.2f}"
+            pbar.set_postfix(postfix)
 
             # 记录到 TensorBoard
             if self.use_tensorboard and self.clock.step % 10 == 0:

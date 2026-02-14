@@ -25,7 +25,8 @@ class OmniCADDataset(Dataset):
     """
     def __init__(self, cad_vec_dir, text_dir, image_dir, split='all', sample_limit=None,
                  category_start=0, category_end=None, text_only=False,
-                 num_selected_views=2, random_select_views=True):
+                 num_selected_views=2, random_select_views=True,
+                 clean_invalid_samples=False, clean_cache_path=None, clean_with_occ=True):
         """
         初始化 Omni-CAD 数据集。
 
@@ -40,6 +41,9 @@ class OmniCADDataset(Dataset):
             text_only (bool): 仅使用文本模态，跳过图像加载（第一阶段训练）。
             num_selected_views (int): 多视图融合时选择的视图数量 (默认2)。
             random_select_views (bool): 是否随机选择视图 (训练时True，推理时False)。
+            clean_invalid_samples (bool): 是否在加载阶段过滤非法样本。
+            clean_cache_path (str, optional): 合法性缓存json路径，避免重复检查。
+            clean_with_occ (bool): 清洗时是否使用OpenCascade几何检查。
         """
         self.cad_vec_dir = cad_vec_dir
         self.text_dir = text_dir
@@ -52,9 +56,17 @@ class OmniCADDataset(Dataset):
         self.num_views = 8
         self.num_selected_views = num_selected_views
         self.random_select_views = random_select_views
+        self.clean_invalid_samples = clean_invalid_samples
+        self.clean_cache_path = clean_cache_path
+        self.clean_with_occ = clean_with_occ
+        self._occ_validator_ready = False
+        self._vec2CADsolid = None
+        self._BRepCheck_Analyzer = None
 
         self.samples = []
         self._load_samples()
+        if self.clean_invalid_samples:
+            self._filter_invalid_samples()
 
         self.text_captions = self._load_text_captions()
 
@@ -110,6 +122,111 @@ class OmniCADDataset(Dataset):
 
         print(f"收集到 {len(self.samples)} 个样本。")
 
+    def _load_clean_cache(self):
+        if not self.clean_cache_path:
+            return {}
+        if not os.path.exists(self.clean_cache_path):
+            return {}
+        try:
+            with open(self.clean_cache_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                return data
+        except Exception as e:
+            print(f"警告: 读取清洗缓存失败 {self.clean_cache_path}: {e}")
+        return {}
+
+    def _save_clean_cache(self, cache):
+        if not self.clean_cache_path:
+            return
+        try:
+            cache_dir = os.path.dirname(self.clean_cache_path)
+            if cache_dir:
+                os.makedirs(cache_dir, exist_ok=True)
+            with open(self.clean_cache_path, 'w', encoding='utf-8') as f:
+                json.dump(cache, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            print(f"警告: 写入清洗缓存失败 {self.clean_cache_path}: {e}")
+
+    def _init_occ_validator(self):
+        if self._occ_validator_ready:
+            return True
+        if not self.clean_with_occ:
+            return False
+        try:
+            from cadlib.visualize import vec2CADsolid
+            from OCC.Core.BRepCheck import BRepCheck_Analyzer
+            self._vec2CADsolid = vec2CADsolid
+            self._BRepCheck_Analyzer = BRepCheck_Analyzer
+            self._occ_validator_ready = True
+            return True
+        except Exception as e:
+            print(f"警告: OCC清洗不可用，降级为基础规则过滤: {e}")
+            self.clean_with_occ = False
+            return False
+
+    def _is_sample_valid(self, h5_path):
+        try:
+            with h5py.File(h5_path, 'r') as fp:
+                if 'vec' not in fp:
+                    return False
+                cad_vec_17d = fp['vec'][:]  # type: ignore
+        except Exception:
+            return False
+
+        if cad_vec_17d.ndim != 2 or cad_vec_17d.shape[1] != 17:
+            return False
+
+        # 基础规则：命令索引合法
+        cmds = cad_vec_17d[:, 0]
+        if np.any((cmds < 0) | (cmds > EXT_IDX)):
+            return False
+
+        # 可选 OCC 几何合法性检查
+        if not self.clean_with_occ:
+            return True
+        if not self._init_occ_validator():
+            return True
+
+        try:
+            shape = self._vec2CADsolid(cad_vec_17d.astype(np.float32), is_numerical=True, n=256)  # type: ignore
+            if shape is None:
+                return False
+            analyzer = self._BRepCheck_Analyzer(shape)  # type: ignore
+            return bool(analyzer.IsValid())
+        except Exception:
+            return False
+
+    def _filter_invalid_samples(self):
+        if len(self.samples) == 0:
+            return
+        print("开始数据清洗: 过滤非法样本...")
+        cache = self._load_clean_cache()
+
+        kept_samples = []
+        checked = 0
+        dropped = 0
+        updated_cache = False
+        for sample in tqdm(self.samples, desc="清洗样本", leave=False):
+            sample_id = sample['id']
+            key = sample_id
+            if key in cache:
+                is_valid = bool(cache[key])
+            else:
+                is_valid = self._is_sample_valid(sample['h5_path'])
+                cache[key] = bool(is_valid)
+                updated_cache = True
+            checked += 1
+            if is_valid:
+                kept_samples.append(sample)
+            else:
+                dropped += 1
+
+        self.samples = kept_samples
+        print(f"数据清洗完成: 检查 {checked} 个样本，过滤 {dropped} 个，保留 {len(self.samples)} 个。")
+        if updated_cache:
+            self._save_clean_cache(cache)
+
     def _load_text_captions(self):
         """
         加载所有文本描述到内存中。
@@ -158,19 +275,20 @@ class OmniCADDataset(Dataset):
             # 复制草图参数
             vec_13d[1:6] = vec_17d[1:6]
         elif command == EXT_IDX:
-            # 角度转换为Token
-            theta, phi, gamma = vec_17d[6], vec_17d[7], vec_17d[8]
-            i_theta = np.clip(np.floor((theta / np.pi) * 9), 0, 8)
-            i_phi = np.clip(np.floor(((phi + np.pi) / (2 * np.pi)) * 9), 0, 8)
-            i_gamma = np.clip(np.floor(((gamma + np.pi) / (2 * np.pi)) * 9), 0, 8)
-            vec_13d[6] = i_theta * 81 + i_phi * 9 + i_gamma
+            # 17D中朝向/位置为量化值(0~255)，需离散到 9/36 bins。
+            # 旧实现按弧度/0~1映射会导致 token 严重偏置。
+            theta, phi, gamma = np.clip(vec_17d[6:9], 0, 255)
+            i_theta = np.clip(np.floor(theta * 9 / 256), 0, 8).astype(np.int32)
+            i_phi = np.clip(np.floor(phi * 9 / 256), 0, 8).astype(np.int32)
+            i_gamma = np.clip(np.floor(gamma * 9 / 256), 0, 8).astype(np.int32)
+            vec_13d[6] = int(i_theta * 81 + i_phi * 9 + i_gamma)
 
-            # 位置转换为Token
-            px, py, pz = vec_17d[9], vec_17d[10], vec_17d[11]
-            i_x = np.clip(np.floor(px * 36), 0, 35)
-            i_y = np.clip(np.floor(py * 36), 0, 35)
-            i_z = np.clip(np.floor(pz * 36), 0, 35)
-            vec_13d[7] = i_z * 1296 + i_y * 36 + i_x
+            # 位置转换为 token: x/y/z -> [0,35]
+            px, py, pz = np.clip(vec_17d[9:12], 0, 255)
+            i_x = np.clip(np.floor(px * 36 / 256), 0, 35).astype(np.int32)
+            i_y = np.clip(np.floor(py * 36 / 256), 0, 35).astype(np.int32)
+            i_z = np.clip(np.floor(pz * 36 / 256), 0, 35).astype(np.int32)
+            vec_13d[7] = int(i_z * 1296 + i_y * 36 + i_x)
             
             # 复制剩余的拉伸参数
             vec_13d[8:13] = vec_17d[12:17]

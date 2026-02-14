@@ -47,6 +47,21 @@ class TrainConfig:
     epochs: int = 50
     warmup_step: int = 500
     grad_clip: float = 1.0
+    loss_cmd_weight: float = 2.0
+    loss_args_weight: float = 1.0
+    loss_tolerance: int = 3
+    loss_alpha: float = 2.0
+    enable_geo_soft_loss: bool = False
+    geo_probe_every: int = 100
+    geo_probe_samples: int = 4
+    geo_probe_ema: float = 0.8
+    geo_lambda_warmup_ratio: float = 0.3
+    geo_lambda_seg_start: float = 0.0
+    geo_lambda_seg_end: float = 0.15
+    geo_lambda_dang_start: float = 0.0
+    geo_lambda_dang_end: float = 0.15
+    geo_seg_clip: float = 5.0
+    geo_dang_clip: float = 5.0
 
     # 数据集
     sample_limit: Optional[int] = None  # None 表示使用全部数据
@@ -55,6 +70,9 @@ class TrainConfig:
     num_workers: int = 4
     category_start: int = 0  # 起始类别 (0000)
     category_end: Optional[int] = None  # 结束类别 (None表示全部)
+    clean_invalid_samples: bool = False
+    clean_cache_path: Optional[str] = None
+    clean_with_occ: bool = True
 
     # 保存策略
     save_every: int = 5
@@ -108,6 +126,36 @@ def parse_args():
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--warmup_step", type=int, default=500)
     parser.add_argument("--grad_clip", type=float, default=1.0)
+    parser.add_argument("--loss_cmd_weight", type=float, default=2.0,
+                        help="命令损失权重 (默认2.0)")
+    parser.add_argument("--loss_args_weight", type=float, default=1.0,
+                        help="参数损失权重 (默认1.0)")
+    parser.add_argument("--loss_tolerance", type=int, default=3,
+                        help="参数局部soft label容差半径 (默认3)")
+    parser.add_argument("--loss_alpha", type=float, default=2.0,
+                        help="参数局部soft label指数衰减系数 (默认2.0)")
+    parser.add_argument("--enable_geo_soft_loss", action="store_true",
+                        help="启用几何软目标训练（在线OCC探针 + 动态权重）")
+    parser.add_argument("--geo_probe_every", type=int, default=100,
+                        help="几何探针间隔步数 (默认100)")
+    parser.add_argument("--geo_probe_samples", type=int, default=4,
+                        help="每次几何探针抽样数量 (默认4)")
+    parser.add_argument("--geo_probe_ema", type=float, default=0.8,
+                        help="几何探针EMA平滑系数 (默认0.8)")
+    parser.add_argument("--geo_lambda_warmup_ratio", type=float, default=0.3,
+                        help="几何权重开始爬升前的训练占比 (默认0.3)")
+    parser.add_argument("--geo_lambda_seg_start", type=float, default=0.0,
+                        help="SegE权重起始值")
+    parser.add_argument("--geo_lambda_seg_end", type=float, default=0.15,
+                        help="SegE权重终值")
+    parser.add_argument("--geo_lambda_dang_start", type=float, default=0.0,
+                        help="DangEL权重起始值")
+    parser.add_argument("--geo_lambda_dang_end", type=float, default=0.15,
+                        help="DangEL权重终值")
+    parser.add_argument("--geo_seg_clip", type=float, default=5.0,
+                        help="SegE_rel裁剪上限 (默认5.0)")
+    parser.add_argument("--geo_dang_clip", type=float, default=5.0,
+                        help="DangEL_norm裁剪上限 (默认5.0)")
 
     # 数据集
     parser.add_argument("--sample_limit", type=int, default=None,
@@ -120,6 +168,12 @@ def parse_args():
                         help="起始类别编号 (默认0，即0000)")
     parser.add_argument("--category_end", type=int, default=None,
                         help="结束类别编号 (包含)，如 --category_end 9 表示加载0000-0009")
+    parser.add_argument("--clean_invalid_samples", action="store_true",
+                        help="数据集预处理阶段过滤非法样本")
+    parser.add_argument("--clean_cache_path", type=str, default=None,
+                        help="清洗缓存json路径（避免重复OCC检查）")
+    parser.add_argument("--no_clean_with_occ", action="store_true",
+                        help="清洗时不使用OCC，仅基础规则过滤")
 
     # 保存
     parser.add_argument("--save_every", type=int, default=5)
@@ -176,12 +230,30 @@ def main():
         epochs=args.epochs,
         warmup_step=args.warmup_step,
         grad_clip=args.grad_clip,
+        loss_cmd_weight=args.loss_cmd_weight,
+        loss_args_weight=args.loss_args_weight,
+        loss_tolerance=args.loss_tolerance,
+        loss_alpha=args.loss_alpha,
+        enable_geo_soft_loss=args.enable_geo_soft_loss,
+        geo_probe_every=args.geo_probe_every,
+        geo_probe_samples=args.geo_probe_samples,
+        geo_probe_ema=args.geo_probe_ema,
+        geo_lambda_warmup_ratio=args.geo_lambda_warmup_ratio,
+        geo_lambda_seg_start=args.geo_lambda_seg_start,
+        geo_lambda_seg_end=args.geo_lambda_seg_end,
+        geo_lambda_dang_start=args.geo_lambda_dang_start,
+        geo_lambda_dang_end=args.geo_lambda_dang_end,
+        geo_seg_clip=args.geo_seg_clip,
+        geo_dang_clip=args.geo_dang_clip,
         sample_limit=args.sample_limit,
         val_split=args.val_split,
         test_split=args.test_split,
         num_workers=args.num_workers,
         category_start=args.category_start,
         category_end=args.category_end,
+        clean_invalid_samples=args.clean_invalid_samples,
+        clean_cache_path=args.clean_cache_path,
+        clean_with_occ=not args.no_clean_with_occ,
         save_every=args.save_every,
         eval_every=args.eval_every,
         full_eval_every=args.full_eval_every,
@@ -204,6 +276,23 @@ def main():
     print(f"数据目录: {cfg.cad_vec_dir}")
     print(f"批次大小: {cfg.batch_size}")
     print(f"学习率: {cfg.lr}")
+    print(
+        f"损失权重(cmd/args): {cfg.loss_cmd_weight:.2f}/{cfg.loss_args_weight:.2f}, "
+        f"soft(tol={cfg.loss_tolerance}, alpha={cfg.loss_alpha:.2f})"
+    )
+    if cfg.enable_geo_soft_loss:
+        print(
+            f"几何软目标: on, probe_every={cfg.geo_probe_every}, probe_samples={cfg.geo_probe_samples}, "
+            f"seg_lambda={cfg.geo_lambda_seg_start:.3f}->{cfg.geo_lambda_seg_end:.3f}, "
+            f"dang_lambda={cfg.geo_lambda_dang_start:.3f}->{cfg.geo_lambda_dang_end:.3f}"
+        )
+    else:
+        print("几何软目标: off")
+    if cfg.clean_invalid_samples:
+        print(
+            f"数据清洗: on (occ={'on' if cfg.clean_with_occ else 'off'}, "
+            f"cache={cfg.clean_cache_path if cfg.clean_cache_path else 'none'})"
+        )
     print(f"Epochs: {cfg.epochs}")
     print(f"随机种子: {cfg.seed}")
     if cfg.category_end is not None:
@@ -227,7 +316,10 @@ def main():
         category_start=cfg.category_start,
         category_end=cfg.category_end,
         text_only=cfg.text_only,
-        num_selected_views=cfg.num_selected_views
+        num_selected_views=cfg.num_selected_views,
+        clean_invalid_samples=cfg.clean_invalid_samples,
+        clean_cache_path=cfg.clean_cache_path,
+        clean_with_occ=cfg.clean_with_occ,
     )
 
     # 划分训练/验证/测试集 (三集划分)

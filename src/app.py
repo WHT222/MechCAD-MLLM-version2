@@ -532,6 +532,9 @@ def run_evaluation_and_visualize(
     batch_size,
     num_selected_views,
     n_latents,
+    category_start,
+    category_end,
+    sample_limit,
     full_eval_max_samples,
     deterministic_views,
     skip_full_eval,
@@ -567,10 +570,15 @@ def run_evaluation_and_visualize(
             "--batch_size", str(int(batch_size)),
             "--num_selected_views", str(int(num_selected_views)),
             "--n_latents", str(int(n_latents)),
+            "--category_start", str(int(category_start) if category_start is not None else 0),
             "--full_eval_max_samples", str(int(full_eval_max_samples)),
             "--metrics_output", metrics_abs,
             "--log_dir", log_dir,
         ]
+        if category_end is not None and str(category_end).strip() != "":
+            cmd.extend(["--category_end", str(int(float(category_end)))])
+        if sample_limit is not None and str(sample_limit).strip() != "":
+            cmd.extend(["--sample_limit", str(int(float(sample_limit)))])
         if text_only:
             cmd.append("--text_only")
         if deterministic_views:
@@ -756,6 +764,18 @@ def create_ui():
                         with gr.Row():
                             run_num_views = gr.Number(label="num_selected_views", value=2, precision=0)
                             run_n_latents = gr.Number(label="n_latents", value=64, precision=0)
+                        with gr.Row():
+                            run_category_start = gr.Number(label="category_start", value=0, precision=0)
+                            run_category_end = gr.Textbox(
+                                label="category_end（可选）",
+                                placeholder="例如 9，留空表示全部",
+                                value=""
+                            )
+                            run_sample_limit = gr.Textbox(
+                                label="sample_limit（可选）",
+                                placeholder="例如 200，留空表示全部",
+                                value=""
+                            )
                         run_metrics_output = gr.Textbox(
                             label="输出指标路径（可选）",
                             placeholder="留空则默认写到 checkpoint 同目录",
@@ -787,6 +807,9 @@ def create_ui():
                         run_batch_size,
                         run_num_views,
                         run_n_latents,
+                        run_category_start,
+                        run_category_end,
+                        run_sample_limit,
                         run_eval_max_samples,
                         run_deterministic_views,
                         run_skip_full_eval,

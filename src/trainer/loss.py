@@ -10,7 +10,11 @@ if project_root not in sys.path:
     sys.path.append(project_root)
 
 from cadlib.macro import *
-from src.unified_vocab.vocab import VOCAB_SIZE, MAX_ARGS_PER_CMD
+from src.unified_vocab.vocab import (
+    VOCAB_SIZE, MAX_ARGS_PER_CMD,
+    PARAM_OFFSET, ANGLE_OFFSET, POS_OFFSET,
+    get_param_type_masks,
+)
 
 
 class CADLoss(nn.Module):
@@ -274,7 +278,7 @@ class UnifiedCADLoss(nn.Module):
 
     简洁设计：
     - loss_cmd: 命令分类损失 (交叉熵)
-    - loss_args: 统一大词表参数损失 (Gumbel软标签)
+    - loss_args: 统一大词表参数损失（类型感知）
 
     双解码器结构保持不变，参数预测改为大词汇表分类。
     """
@@ -288,24 +292,24 @@ class UnifiedCADLoss(nn.Module):
 
         # 损失权重
         self.weights = weights or {
-            'cmd': 1.0,
+            'cmd': 2.0,
             'args': 1.0,
         }
 
-        # Gumbel软标签参数
+        # 软标签参数（仅用于数值参数位置）
         self.tolerance = tolerance
         self.alpha = alpha
 
-        # 构建参数位置掩码: 哪些位置对哪些命令有效
-        # [n_commands, MAX_ARGS_PER_CMD]
-        # 使用完整参数序列模板长度（包含边界Token和SEP）。
-        from src.unified_vocab.vocab import CMD_SEQUENCE_TEMPLATES
-        args_mask = np.zeros((self.n_commands, MAX_ARGS_PER_CMD), dtype=np.float32)
-        for cmd_idx in range(self.n_commands):
-            template = CMD_SEQUENCE_TEMPLATES.get(cmd_idx, ['SEP'])
-            seq_len = min(len(template), MAX_ARGS_PER_CMD)
-            args_mask[cmd_idx, :seq_len] = 1.0
-        self.register_buffer("args_mask", torch.tensor(args_mask))
+        # 参数类型掩码 [n_commands, MAX_ARGS_PER_CMD]
+        type_masks = get_param_type_masks(n_commands=self.n_commands)
+        self.register_buffer("param_type_mask", torch.tensor(type_masks['param_mask']))
+        self.register_buffer("angle_type_mask", torch.tensor(type_masks['angle_mask']))
+        self.register_buffer("pos_type_mask", torch.tensor(type_masks['pos_mask']))
+        self.register_buffer("boundary_type_mask", torch.tensor(type_masks['boundary_mask']))
+        self.register_buffer("sep_type_mask", torch.tensor(type_masks['sep_mask']))
+
+        # 命令名称用于监控日志 key
+        self.command_names = [str(name).lower() for name in ALL_COMMANDS[:self.n_commands]]
 
     def forward(self, outputs, batch):
         """
@@ -332,8 +336,8 @@ class UnifiedCADLoss(nn.Module):
             outputs['command_logits'], tgt_commands, valid_mask
         )
 
-        # 2. 参数损失 (Gumbel软标签)
-        loss_args = self._compute_args_loss(
+        # 2. 参数损失（类型感知）
+        loss_args, args_detail = self._compute_args_loss(
             outputs['unified_args_logits'], tgt_args, tgt_commands, valid_mask
         )
 
@@ -343,11 +347,22 @@ class UnifiedCADLoss(nn.Module):
             self.weights['args'] * loss_args
         )
 
-        return {
+        metrics = self._compute_training_metrics(
+            outputs['command_logits'],
+            outputs['unified_args_logits'],
+            tgt_commands,
+            tgt_args,
+            valid_mask
+        )
+
+        result = {
             'loss': total_loss,
             'loss_cmd': loss_cmd,
             'loss_args': loss_args,
         }
+        result.update(args_detail)
+        result.update(metrics)
+        return result
 
     def _get_valid_mask(self, commands):
         """获取有效序列位置的掩码"""
@@ -372,7 +387,7 @@ class UnifiedCADLoss(nn.Module):
 
     def _compute_args_loss(self, logits, targets, commands, valid_mask):
         """
-        计算统一大词表参数损失 (Gumbel软标签)
+        计算统一大词表参数损失（类型感知）
 
         Args:
             logits: [B, S, MAX_ARGS_PER_CMD, VOCAB_SIZE]
@@ -380,41 +395,150 @@ class UnifiedCADLoss(nn.Module):
             commands: [B, S]
             valid_mask: [B, S]
         """
-        B, S, N_ARGS, V = logits.shape
+        _, _, _, V = logits.shape
         device = logits.device
         logits = logits.float()
 
-        # 获取每个命令对应的参数位置掩码
-        cmd_mask = self.args_mask[commands.long()]  # [B, S, MAX_ARGS_PER_CMD]
+        cmd_idx = commands.long().clamp(0, self.n_commands - 1)
+        vmask = valid_mask.unsqueeze(-1)
 
-        # 组合掩码
-        combined_mask = valid_mask.unsqueeze(-1) * cmd_mask  # [B, S, MAX_ARGS_PER_CMD]
-
-        if combined_mask.sum() < 1:
-            return torch.tensor(0.0, device=device)
+        # 按 token 类型构建掩码
+        param_mask = vmask * self.param_type_mask[cmd_idx]
+        angle_mask = vmask * self.angle_type_mask[cmd_idx]
+        pos_mask = vmask * self.pos_type_mask[cmd_idx]
+        boundary_mask = vmask * self.boundary_type_mask[cmd_idx]
+        sep_mask = vmask * self.sep_type_mask[cmd_idx]
 
         # log_softmax 提高数值稳定性
         log_probs = F.log_softmax(logits, dim=-1)  # [B, S, N_ARGS, V]
 
-        # 目标值
-        targets_clamped = targets.long().clamp(0, V - 1)
+        # 数值参数位置: 局部 soft label（限制在对应 token 区间）
+        param_numer, param_count = self._masked_local_soft_ce(
+            log_probs, targets, param_mask, PARAM_OFFSET, ANGLE_OFFSET
+        )
+        angle_numer, angle_count = self._masked_local_soft_ce(
+            log_probs, targets, angle_mask, ANGLE_OFFSET, POS_OFFSET
+        )
+        pos_numer, pos_count = self._masked_local_soft_ce(
+            log_probs, targets, pos_mask, POS_OFFSET, self.vocab_size
+        )
 
-        # 构建Gumbel软标签分布
-        target_dist = torch.zeros(B, S, N_ARGS, V, dtype=torch.float32, device=device)
+        # 边界/SEP位置: 硬标签 CE
+        boundary_numer, boundary_count = self._masked_hard_ce(
+            log_probs, targets, boundary_mask, V
+        )
+        sep_numer, sep_count = self._masked_hard_ce(
+            log_probs, targets, sep_mask, V
+        )
 
-        for shift in range(-self.tolerance, self.tolerance + 1):
-            shifted_target = (targets_clamped + shift).clamp(0, V - 1)
-            weight = torch.exp(torch.tensor(-self.alpha * abs(shift), dtype=torch.float32, device=device))
-            src = weight * torch.ones(B, S, N_ARGS, 1, dtype=torch.float32, device=device)
-            target_dist.scatter_add_(3, shifted_target.unsqueeze(-1), src)
+        total_numer = param_numer + angle_numer + pos_numer + boundary_numer + sep_numer
+        total_count = param_count + angle_count + pos_count + boundary_count + sep_count
 
-        # 归一化
-        target_dist = target_dist / (target_dist.sum(dim=-1, keepdim=True) + 1e-8)
+        if total_count < 1:
+            zero = torch.tensor(0.0, device=device, dtype=torch.float32)
+            return zero, {
+                'loss_args_param': zero,
+                'loss_args_angle': zero,
+                'loss_args_pos': zero,
+                'loss_args_boundary': zero,
+                'loss_args_sep': zero,
+            }
 
-        # 交叉熵损失
-        loss_per_pos = -torch.sum(target_dist * log_probs, dim=-1)  # [B, S, N_ARGS]
-        loss_per_pos = torch.where(torch.isnan(loss_per_pos), torch.zeros_like(loss_per_pos), loss_per_pos)
+        total_loss = total_numer / (total_count + 1e-8)
 
-        loss = (loss_per_pos * combined_mask).sum() / (combined_mask.sum() + 1e-8)
+        detail = {
+            'loss_args_param': param_numer / (param_count + 1e-8),
+            'loss_args_angle': angle_numer / (angle_count + 1e-8),
+            'loss_args_pos': pos_numer / (pos_count + 1e-8),
+            'loss_args_boundary': boundary_numer / (boundary_count + 1e-8),
+            'loss_args_sep': sep_numer / (sep_count + 1e-8),
+        }
+        return total_loss, detail
 
-        return loss
+    def _masked_hard_ce(self, log_probs, targets, mask, vocab_size):
+        """对掩码位置计算硬标签 CE 的分子与计数。"""
+        count = mask.sum()
+        if count < 1:
+            zero = torch.tensor(0.0, device=log_probs.device, dtype=torch.float32)
+            return zero, zero
+
+        tgt = targets.long().clamp(0, vocab_size - 1)
+        nll = -torch.gather(log_probs, dim=-1, index=tgt.unsqueeze(-1)).squeeze(-1)
+        nll = torch.where(torch.isnan(nll), torch.zeros_like(nll), nll)
+        numer = (nll * mask).sum()
+        return numer, count
+
+    def _masked_local_soft_ce(self, log_probs, targets, mask, low, high):
+        """对掩码位置计算局部 soft label CE（限制在 [low, high) 范围）。"""
+        count = mask.sum()
+        if count < 1:
+            zero = torch.tensor(0.0, device=log_probs.device, dtype=torch.float32)
+            return zero, zero
+
+        device = log_probs.device
+        tgt = targets.long().clamp(low, high - 1)
+
+        shifts = torch.arange(-self.tolerance, self.tolerance + 1, device=device, dtype=torch.long)
+        weights = torch.exp(-self.alpha * shifts.abs().float())  # [K]
+        weight_sum = weights.sum() + 1e-8
+
+        shifted = tgt.unsqueeze(-1) + shifts.view(1, 1, 1, -1)
+        shifted = shifted.clamp(low, high - 1)
+
+        logp = torch.gather(log_probs, dim=-1, index=shifted)  # [B, S, N_ARGS, K]
+        nll = -((logp * weights.view(1, 1, 1, -1)).sum(dim=-1) / weight_sum)
+        nll = torch.where(torch.isnan(nll), torch.zeros_like(nll), nll)
+
+        numer = (nll * mask).sum()
+        return numer, count
+
+    @torch.no_grad()
+    def _compute_training_metrics(self, cmd_logits, args_logits, tgt_commands, tgt_args, valid_mask):
+        """训练期监控指标：命令召回 + token类型准确率。"""
+        metrics = {}
+        eps = 1e-8
+        valid = valid_mask.float()
+
+        pred_cmd = cmd_logits.argmax(dim=-1)
+        pred_args = args_logits.argmax(dim=-1)
+        cmd_idx = tgt_commands.long().clamp(0, self.n_commands - 1)
+
+        # 命令召回率（重点关注 EXT）
+        for cmd_i, cmd_name in enumerate(self.command_names):
+            gt_mask = ((tgt_commands == cmd_i).float() * valid)
+            denom = gt_mask.sum()
+            if denom < 1:
+                metrics[f'cmd_recall_{cmd_name}'] = torch.tensor(
+                    0.0, device=cmd_logits.device, dtype=torch.float32
+                )
+            else:
+                hit = (((pred_cmd == cmd_i).float()) * gt_mask).sum()
+                metrics[f'cmd_recall_{cmd_name}'] = hit / (denom + eps)
+
+        total_valid = valid.sum()
+        if total_valid < 1:
+            metrics['cmd_ext_pred_ratio'] = torch.tensor(0.0, device=cmd_logits.device, dtype=torch.float32)
+            metrics['cmd_ext_gt_ratio'] = torch.tensor(0.0, device=cmd_logits.device, dtype=torch.float32)
+        else:
+            metrics['cmd_ext_pred_ratio'] = (((pred_cmd == EXT_IDX).float() * valid).sum()) / (total_valid + eps)
+            metrics['cmd_ext_gt_ratio'] = (((tgt_commands == EXT_IDX).float() * valid).sum()) / (total_valid + eps)
+
+        # 参数 token 类型准确率
+        type_masks = {
+            'param': self.param_type_mask[cmd_idx],
+            'angle': self.angle_type_mask[cmd_idx],
+            'pos': self.pos_type_mask[cmd_idx],
+            'boundary': self.boundary_type_mask[cmd_idx],
+            'sep': self.sep_type_mask[cmd_idx],
+        }
+
+        args_match = (pred_args == tgt_args).float()
+        for name, tmask in type_masks.items():
+            mask = valid.unsqueeze(-1) * tmask
+            denom = mask.sum()
+            if denom < 1:
+                metrics[f'args_acc_{name}'] = torch.tensor(0.0, device=cmd_logits.device, dtype=torch.float32)
+            else:
+                metrics[f'args_acc_{name}'] = (args_match * mask).sum() / (denom + eps)
+
+        return metrics
