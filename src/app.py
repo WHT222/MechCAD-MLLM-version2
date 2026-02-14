@@ -16,6 +16,7 @@ import sys
 import json
 import glob
 import argparse
+import subprocess
 import numpy as np
 from datetime import datetime
 from pathlib import Path
@@ -43,6 +44,8 @@ from cadlib.macro import *
 # ============== 全局变量 ==============
 MODEL = None
 MODEL_PATH = None
+OUTPUTS_DIR = os.path.abspath(os.path.join(project_root, "outputs"))
+UI_EXPORT_DIR = os.path.join(OUTPUTS_DIR, "ui_generated_models")
 
 
 # ============== 模型加载 ==============
@@ -84,7 +87,7 @@ def load_model(checkpoint_path, llava_path="model_weights/llava-hf/llava-1.5-7b-
 
 
 # ============== CAD 生成 ==============
-def generate_cad(text_input, image_input, use_image, export_stl):
+def generate_cad(text_input, image_input, use_image, export_stl, preview_mode):
     """生成 CAD 序列"""
     global MODEL
 
@@ -148,7 +151,8 @@ def generate_cad(text_input, image_input, use_image, export_stl):
         stl_path = None
 
         try:
-            out_dir = os.path.join("outputs", "ui_generated_models")
+            out_dir = UI_EXPORT_DIR
+            os.makedirs(out_dir, exist_ok=True)
             safe_text = "".join(c if c.isalnum() else "_" for c in text_input).strip("_")
             safe_text = safe_text[:40] if safe_text else "cad"
             stem = f"{safe_text}_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
@@ -159,11 +163,12 @@ def generate_cad(text_input, image_input, use_image, export_stl):
                 stem=stem,
                 export_step=True,
                 export_stl=bool(export_stl),
-                export_preview=True
+                export_preview=True,
+                preview_mode=preview_mode
             )
-            preview_path = artifacts.get('preview_path')
-            step_path = artifacts.get('step_path')
-            stl_path = artifacts.get('stl_path')
+            preview_path = os.path.abspath(artifacts['preview_path']) if artifacts.get('preview_path') else None
+            step_path = os.path.abspath(artifacts['step_path']) if artifacts.get('step_path') else None
+            stl_path = os.path.abspath(artifacts['stl_path']) if artifacts.get('stl_path') else None
         except Exception as export_err:
             status += f"\n⚠️ 模型导出失败: {export_err}"
 
@@ -362,6 +367,241 @@ def load_test_metrics_file(metrics_path):
         return {}, f"❌ 读取失败: {e}"
 
 
+def _get_metric(payload, paths, default=None):
+    """从多个候选路径里读取第一个存在的指标值。"""
+    for path in paths:
+        cur = payload
+        ok = True
+        for key in path:
+            if not isinstance(cur, dict) or key not in cur:
+                ok = False
+                break
+            cur = cur[key]
+        if ok:
+            return cur
+    return default
+
+
+def summarize_metrics(payload):
+    """生成评估摘要、表格和可视化图。"""
+    import matplotlib.pyplot as plt
+
+    if not isinstance(payload, dict) or len(payload) == 0:
+        return "❌ 指标内容为空", [], None, None
+
+    checkpoint = payload.get("checkpoint", "未知")
+    split_name = payload.get("split", "test")
+    timestamp = payload.get("timestamp", "未知")
+    validate_loss = _get_metric(payload, [["validate_loss"], ["test_loss"]], default=None)
+
+    cmd_acc = _get_metric(payload, [
+        ["validate_metrics", "cmd_accuracy"],
+        ["test_metrics", "cmd_accuracy"],
+        ["eval_metrics", "cmd_accuracy"]
+    ], default=-1.0)
+    args_mae = _get_metric(payload, [["eval_metrics", "args_mae"]], default=-1.0)
+    chamfer = _get_metric(payload, [["eval_metrics", "chamfer_distance"]], default=-1.0)
+    sege = _get_metric(payload, [["eval_metrics", "sege"]], default=-1.0)
+    dangel = _get_metric(payload, [["eval_metrics", "dangel"]], default=-1.0)
+    dangel_norm = _get_metric(payload, [["eval_metrics", "dangel_norm"]], default=-1.0)
+
+    c_valid = _get_metric(payload, [["eval_metrics", "chamfer_valid_count"]], default=-1)
+    c_failed = _get_metric(payload, [["eval_metrics", "chamfer_failed_count"]], default=-1)
+    m_valid = _get_metric(payload, [["eval_metrics", "mesh_valid_count"]], default=-1)
+    m_failed = _get_metric(payload, [["eval_metrics", "mesh_failed_count"]], default=-1)
+
+    summary_lines = [
+        f"检查点: {checkpoint}",
+        f"评估划分: {split_name}",
+        f"时间戳: {timestamp}",
+    ]
+    if validate_loss is not None:
+        summary_lines.append(f"验证损失: {float(validate_loss):.6f}")
+    if cmd_acc is not None and float(cmd_acc) >= 0:
+        summary_lines.append(f"命令准确率: {float(cmd_acc) * 100:.2f}%")
+    if args_mae is not None and float(args_mae) >= 0:
+        summary_lines.append(f"参数 MAE: {float(args_mae):.6f}")
+    if chamfer is not None and float(chamfer) >= 0:
+        summary_lines.append(f"Chamfer Distance: {float(chamfer):.6f}")
+    if sege is not None and float(sege) >= 0:
+        summary_lines.append(f"SegE: {float(sege):.6f}")
+    if dangel is not None and float(dangel) >= 0:
+        summary_lines.append(f"DangEL: {float(dangel):.6f}")
+    if dangel_norm is not None and float(dangel_norm) >= 0:
+        summary_lines.append(f"DangEL(norm): {float(dangel_norm):.6f}")
+
+    summary_text = "\n".join(summary_lines)
+
+    rows = []
+    if cmd_acc is not None and float(cmd_acc) >= 0:
+        rows.append(["cmd_accuracy", float(cmd_acc)])
+    if args_mae is not None and float(args_mae) >= 0:
+        rows.append(["args_mae", float(args_mae)])
+    if chamfer is not None and float(chamfer) >= 0:
+        rows.append(["chamfer_distance", float(chamfer)])
+    if sege is not None and float(sege) >= 0:
+        rows.append(["sege", float(sege)])
+    if dangel is not None and float(dangel) >= 0:
+        rows.append(["dangel", float(dangel)])
+    if dangel_norm is not None and float(dangel_norm) >= 0:
+        rows.append(["dangel_norm", float(dangel_norm)])
+    if c_valid >= 0:
+        rows.append(["chamfer_valid_count", int(c_valid)])
+    if c_failed >= 0:
+        rows.append(["chamfer_failed_count", int(c_failed)])
+    if m_valid >= 0:
+        rows.append(["mesh_valid_count", int(m_valid)])
+    if m_failed >= 0:
+        rows.append(["mesh_failed_count", int(m_failed)])
+
+    metric_labels = []
+    metric_values = []
+    if cmd_acc is not None and float(cmd_acc) >= 0:
+        metric_labels.append("cmd_acc(%)")
+        metric_values.append(float(cmd_acc) * 100.0)
+    if args_mae is not None and float(args_mae) >= 0:
+        metric_labels.append("args_mae")
+        metric_values.append(float(args_mae))
+    if chamfer is not None and float(chamfer) >= 0:
+        metric_labels.append("chamfer")
+        metric_values.append(float(chamfer))
+    if sege is not None and float(sege) >= 0:
+        metric_labels.append("sege")
+        metric_values.append(float(sege))
+    if dangel is not None and float(dangel) >= 0:
+        metric_labels.append("dangel")
+        metric_values.append(float(dangel))
+    if dangel_norm is not None and float(dangel_norm) >= 0:
+        metric_labels.append("dangel_norm")
+        metric_values.append(float(dangel_norm))
+
+    metric_fig = None
+    if len(metric_labels) > 0:
+        metric_fig, ax = plt.subplots(figsize=(8, 4))
+        bars = ax.bar(metric_labels, metric_values, color="#4c78a8")
+        ax.set_title("评估指标总览")
+        ax.set_ylabel("Value")
+        ax.grid(True, axis="y", alpha=0.3)
+        ax.bar_label(bars, fmt="%.4f", padding=2, fontsize=8)
+        plt.xticks(rotation=20, ha="right")
+        plt.tight_layout()
+
+    count_fig = None
+    count_labels = []
+    count_values = []
+    if c_valid >= 0:
+        count_labels.append("chamfer_valid")
+        count_values.append(int(c_valid))
+    if c_failed >= 0:
+        count_labels.append("chamfer_failed")
+        count_values.append(int(c_failed))
+    if m_valid >= 0:
+        count_labels.append("mesh_valid")
+        count_values.append(int(m_valid))
+    if m_failed >= 0:
+        count_labels.append("mesh_failed")
+        count_values.append(int(m_failed))
+
+    if len(count_labels) > 0:
+        count_fig, ax2 = plt.subplots(figsize=(8, 3.5))
+        bars2 = ax2.bar(count_labels, count_values, color="#72b7b2")
+        ax2.set_title("几何评估样本统计")
+        ax2.set_ylabel("Count")
+        ax2.grid(True, axis="y", alpha=0.3)
+        ax2.bar_label(bars2, padding=2, fontsize=8)
+        plt.xticks(rotation=15, ha="right")
+        plt.tight_layout()
+
+    return summary_text, rows, metric_fig, count_fig
+
+
+def load_metrics_and_visualize(metrics_path):
+    """读取指标并返回可视化结果。"""
+    payload, status = load_test_metrics_file(metrics_path)
+    if not payload:
+        return {}, status, "❌ 无法生成可视化", [], None, None
+
+    summary_text, rows, metric_fig, count_fig = summarize_metrics(payload)
+    return payload, status, summary_text, rows, metric_fig, count_fig
+
+
+def run_evaluation_and_visualize(
+    checkpoint_path,
+    text_only,
+    split_name,
+    batch_size,
+    num_selected_views,
+    n_latents,
+    full_eval_max_samples,
+    deterministic_views,
+    skip_full_eval,
+    metrics_output_path,
+):
+    """从前端触发评估脚本，然后加载并可视化评估结果。"""
+    try:
+        if not checkpoint_path:
+            return "", {}, "❌ 请输入 checkpoint 路径", "❌ 无法生成可视化", [], None, None, ""
+
+        ckpt_abs = os.path.abspath(checkpoint_path)
+        if not os.path.exists(ckpt_abs):
+            return "", {}, f"❌ checkpoint 不存在: {ckpt_abs}", "❌ 无法生成可视化", [], None, None, ""
+
+        if metrics_output_path and metrics_output_path.strip():
+            metrics_abs = os.path.abspath(metrics_output_path.strip())
+        else:
+            metrics_abs = os.path.join(os.path.dirname(ckpt_abs), f"{split_name}_metrics.json" if split_name != "test" else "test_metrics.json")
+
+        log_dir = os.path.join(
+            OUTPUTS_DIR,
+            "eval_logs",
+            f"ui_eval_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        )
+        os.makedirs(os.path.dirname(metrics_abs), exist_ok=True)
+
+        eval_script = os.path.join(project_root, "src", "evaluate_checkpoint.py")
+        cmd = [
+            sys.executable,
+            eval_script,
+            "--checkpoint", ckpt_abs,
+            "--split", str(split_name),
+            "--batch_size", str(int(batch_size)),
+            "--num_selected_views", str(int(num_selected_views)),
+            "--n_latents", str(int(n_latents)),
+            "--full_eval_max_samples", str(int(full_eval_max_samples)),
+            "--metrics_output", metrics_abs,
+            "--log_dir", log_dir,
+        ]
+        if text_only:
+            cmd.append("--text_only")
+        if deterministic_views:
+            cmd.append("--deterministic_views")
+        if skip_full_eval:
+            cmd.append("--skip_full_eval")
+
+        proc = subprocess.run(
+            cmd,
+            cwd=project_root,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        run_log = (proc.stdout or "") + ("\n" + proc.stderr if proc.stderr else "")
+
+        if proc.returncode != 0:
+            status = f"❌ 评估执行失败 (exit={proc.returncode})"
+            return metrics_abs, {}, status, "❌ 无法生成可视化", [], None, None, run_log
+
+        payload, status = load_test_metrics_file(metrics_abs)
+        if not payload:
+            return metrics_abs, {}, f"⚠️ 评估完成但读取指标失败: {status}", "❌ 无法生成可视化", [], None, None, run_log
+
+        summary_text, rows, metric_fig, count_fig = summarize_metrics(payload)
+        status = f"✅ 评估完成并已加载: {metrics_abs}"
+        return metrics_abs, payload, status, summary_text, rows, metric_fig, count_fig, run_log
+    except Exception as e:
+        return "", {}, f"❌ 评估异常: {e}", "❌ 无法生成可视化", [], None, None, ""
+
+
 # ============== Gradio 界面 ==============
 def create_ui():
     """创建 Gradio 界面"""
@@ -393,6 +633,11 @@ def create_ui():
                         use_image = gr.Checkbox(label="使用图像（多模态模式）", value=False)
                         image_input = gr.Image(label="输入图像", visible=False)
                         export_stl = gr.Checkbox(label="导出 STL 文件", value=False)
+                        preview_mode = gr.Radio(
+                            choices=[("点云预览（默认，稳定）", "pointcloud"), ("STEP渲染预览（OCC）", "occ_step")],
+                            value="pointcloud",
+                            label="预览转换方式"
+                        )
 
                         generate_btn = gr.Button("生成 CAD 序列", variant="primary")
 
@@ -422,7 +667,7 @@ def create_ui():
                 use_image.change(lambda x: gr.update(visible=x), inputs=[use_image], outputs=[image_input])
                 generate_btn.click(
                     generate_cad,
-                    inputs=[text_input, image_input, use_image, export_stl],
+                    inputs=[text_input, image_input, use_image, export_stl, preview_mode],
                     outputs=[gen_status, cad_output, raw_output, preview_image, step_file, stl_file]
                 )
 
@@ -465,6 +710,99 @@ def create_ui():
                 refresh_btn.click(plot_training_curves, inputs=[log_dir], outputs=[train_plot, log_status])
                 list_btn.click(list_checkpoints, inputs=[model_dir], outputs=[ckpt_list])
                 load_metrics_btn.click(load_test_metrics_file, inputs=[metrics_path], outputs=[metrics_json, metrics_status])
+
+            # ===== 指标评估 =====
+            with gr.TabItem("📈 指标评估"):
+                with gr.Row():
+                    with gr.Column(scale=1):
+                        gr.Markdown("### 方式1：读取已有指标文件")
+                        eval_metrics_path = gr.Textbox(
+                            label="指标文件/目录",
+                            placeholder="outputs/stage2/test_metrics.json 或 outputs/stage2",
+                            value="outputs/checkpoints/test_metrics.json"
+                        )
+                        eval_load_btn = gr.Button("加载并可视化", variant="primary")
+                        eval_status = gr.Textbox(label="状态", interactive=False)
+                        eval_summary = gr.Textbox(label="评估摘要", lines=9, interactive=False)
+                    with gr.Column(scale=1):
+                        eval_json = gr.JSON(label="原始指标 JSON")
+                        eval_table = gr.Dataframe(
+                            label="关键指标表",
+                            headers=["Metric", "Value"],
+                            datatype=["str", "number"],
+                            interactive=False
+                        )
+
+                with gr.Row():
+                    with gr.Column(scale=1):
+                        gr.Markdown("### 方式2：一键运行评估并可视化")
+                        run_ckpt_path = gr.Textbox(
+                            label="Checkpoint 路径",
+                            placeholder="outputs/stage2/best.pth",
+                            value="outputs/stage2/best.pth"
+                        )
+                        with gr.Row():
+                            run_text_only = gr.Checkbox(label="text_only（阶段1）", value=False)
+                            run_deterministic_views = gr.Checkbox(label="固定视图采样", value=True)
+                            run_skip_full_eval = gr.Checkbox(label="仅validate（跳过几何指标）", value=False)
+                        with gr.Row():
+                            run_split = gr.Dropdown(
+                                choices=["test", "val", "train", "all"],
+                                value="test",
+                                label="评估数据划分"
+                            )
+                            run_batch_size = gr.Number(label="batch_size", value=4, precision=0)
+                            run_eval_max_samples = gr.Number(label="full_eval_max_samples", value=500, precision=0)
+                        with gr.Row():
+                            run_num_views = gr.Number(label="num_selected_views", value=2, precision=0)
+                            run_n_latents = gr.Number(label="n_latents", value=64, precision=0)
+                        run_metrics_output = gr.Textbox(
+                            label="输出指标路径（可选）",
+                            placeholder="留空则默认写到 checkpoint 同目录",
+                            value=""
+                        )
+                        run_eval_btn = gr.Button("运行评估并加载结果", variant="primary")
+                    with gr.Column(scale=1):
+                        run_log = gr.Textbox(
+                            label="评估执行日志",
+                            lines=14,
+                            interactive=False
+                        )
+
+                with gr.Row():
+                    eval_metric_plot = gr.Plot(label="指标可视化")
+                    eval_count_plot = gr.Plot(label="有效/失败样本统计")
+
+                eval_load_btn.click(
+                    load_metrics_and_visualize,
+                    inputs=[eval_metrics_path],
+                    outputs=[eval_json, eval_status, eval_summary, eval_table, eval_metric_plot, eval_count_plot]
+                )
+                run_eval_btn.click(
+                    run_evaluation_and_visualize,
+                    inputs=[
+                        run_ckpt_path,
+                        run_text_only,
+                        run_split,
+                        run_batch_size,
+                        run_num_views,
+                        run_n_latents,
+                        run_eval_max_samples,
+                        run_deterministic_views,
+                        run_skip_full_eval,
+                        run_metrics_output,
+                    ],
+                    outputs=[
+                        eval_metrics_path,
+                        eval_json,
+                        eval_status,
+                        eval_summary,
+                        eval_table,
+                        eval_metric_plot,
+                        eval_count_plot,
+                        run_log,
+                    ]
+                )
 
             # ===== 示例 =====
             with gr.TabItem("📝 示例"):
@@ -538,7 +876,8 @@ def main():
     app.launch(
         server_name="0.0.0.0",
         server_port=args.port,
-        share=args.share
+        share=args.share,
+        allowed_paths=[OUTPUTS_DIR]
     )
 
 
