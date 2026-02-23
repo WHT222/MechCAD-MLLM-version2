@@ -711,6 +711,7 @@ class MechCADTrainer(BaseTrainer):
         checkpoint_dict = {
             'clock': self.clock.make_checkpoint(),
             'decoder_state_dict': decoder_state,
+            'decoder_arch': 'single_shared',
             'optimizer_state_dict': self.optimizer.state_dict(),
             'scheduler_state_dict': self.scheduler.state_dict(),
             'model_cfg': self.model_cfg
@@ -757,7 +758,13 @@ class MechCADTrainer(BaseTrainer):
         checkpoint = torch.load(load_path, map_location='cpu', weights_only=False)
 
         # 加载模型权重
-        self.net.llm2cad_decoder.load_state_dict(checkpoint['decoder_state_dict'])
+        try:
+            self.net.llm2cad_decoder.load_state_dict(checkpoint['decoder_state_dict'])
+        except RuntimeError as e:
+            raise RuntimeError(
+                "当前分支为 single-decoder ablation，旧 dual-decoder 权重结构不兼容。"
+                f"加载失败: {e}"
+            ) from e
 
         # 如果有多视图融合权重，也加载
         if 'fusion_state_dict' in checkpoint:

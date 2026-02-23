@@ -49,7 +49,13 @@ def load_model(checkpoint_path, llava_path="model_weights/llava-hf/llava-1.5-7b-
     checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
 
     # 加载解码器权重
-    model.llm2cad_decoder.load_state_dict(checkpoint['decoder_state_dict'])
+    try:
+        model.llm2cad_decoder.load_state_dict(checkpoint['decoder_state_dict'])
+    except RuntimeError as e:
+        raise RuntimeError(
+            "当前分支为 single-decoder ablation，旧 dual-decoder 权重结构不兼容。"
+            f"加载失败: {e}"
+        ) from e
 
     # 如果有多视图融合权重，也加载
     if 'fusion_state_dict' in checkpoint:

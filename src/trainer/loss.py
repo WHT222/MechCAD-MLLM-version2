@@ -280,7 +280,7 @@ class UnifiedCADLoss(nn.Module):
     - loss_cmd: 命令分类损失 (交叉熵)
     - loss_args: 统一大词表参数损失（类型感知）
 
-    双解码器结构保持不变，参数预测改为大词汇表分类。
+    适配当前模型输出接口（command_logits + unified_args_logits）。
     """
 
     def __init__(self, cfg, weights=None, tolerance=3, alpha=2.0):

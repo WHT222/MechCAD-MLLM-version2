@@ -78,51 +78,20 @@ class CommandFCN(nn.Module):
     def forward(self, out):
         return self.mlp(out)
 
-class ArgsFCN(nn.Module):
-    """从 Transformer 输出预测参数特征。"""
-    def __init__(self, cfg: MechCADConfig):
-        super().__init__()
-        self.n_args = cfg.cad_n_args
-        self.args_dim = cfg.args_dim
-        self.mlp = nn.Sequential(
-            nn.Linear(cfg.d_model, cfg.d_model * 4), nn.ReLU(),
-            nn.Linear(cfg.d_model * 4, cfg.d_model * 2), nn.ReLU(),
-            nn.Linear(cfg.d_model * 2, self.n_args * self.args_dim)
-        )
-    def forward(self, out):
-        S, N, _ = out.shape
-        args_logits = self.mlp(out)
-        args_logits = args_logits.reshape(S, N, self.n_args, self.args_dim)
-        return args_logits
-
-class CommandDecoder(nn.Module):
-    """从 LLM 特征解码命令序列。"""
-    def __init__(self, cfg: MechCADConfig):
-        super().__init__()
-        self.embedding = ConstEmbedding(cfg)
-        decoder_layer = TransformerDecoderLayer(cfg.d_model, cfg.n_heads, cfg.dim_feedforward, cfg.dropout)
-        self.decoder = TransformerDecoder(decoder_layer, cfg.n_layers_decode, LayerNorm(cfg.d_model))
-        self.fcn = CommandFCN(cfg)
-
-    def forward(self, z, memory_key_padding_mask=None):
-        src = self.embedding(z)
-        out = self.decoder(src, z, memory_key_padding_mask=memory_key_padding_mask)
-        command_logits = self.fcn(out)
-        return command_logits, out
-
-class ArgsDecoder(nn.Module):
-    """从 LLM 特征解码参数序列，使用统一大词表。"""
+class SharedCADDecoder(nn.Module):
+    """共享单解码器：同一主干同时预测命令与参数。"""
     def __init__(self, cfg: MechCADConfig):
         super().__init__()
         self.embedding = ConstEmbedding(cfg)
         decoder_layer = TransformerDecoderLayer(cfg.d_model, cfg.n_heads, cfg.dim_feedforward, cfg.dropout)
         self.decoder = TransformerDecoder(decoder_layer, cfg.n_layers_decode, LayerNorm(cfg.d_model))
 
+        self.command_head = CommandFCN(cfg)
         self.n_args = MAX_ARGS_PER_CMD
         self.vocab_size = VOCAB_SIZE
 
         # 统一大词表输出头
-        self.output_head = nn.Sequential(
+        self.args_head = nn.Sequential(
             nn.Linear(cfg.d_model, cfg.d_model * 2),
             nn.LayerNorm(cfg.d_model * 2),
             nn.GELU(),
@@ -130,23 +99,19 @@ class ArgsDecoder(nn.Module):
             nn.Linear(cfg.d_model * 2, self.n_args * self.vocab_size)
         )
 
-    def forward(self, z, guidance, memory_key_padding_mask=None):
+    def forward(self, z, memory_key_padding_mask=None):
         src = self.embedding(z)
-        src = src + guidance  # 注入来自命令解码器的引导
         out = self.decoder(src, z, memory_key_padding_mask=memory_key_padding_mask)
-        # out: [S, N, d_model]
-
-        # 统一大词表输出
-        logits = self.output_head(out)  # [S, N, n_args * vocab_size]
-        S, N, _ = logits.shape
-        logits = logits.reshape(S, N, self.n_args, self.vocab_size)
-
-        return logits
+        command_logits = self.command_head(out)
+        args_logits = self.args_head(out)  # [S, N, n_args * vocab_size]
+        S, N, _ = args_logits.shape
+        args_logits = args_logits.reshape(S, N, self.n_args, self.vocab_size)
+        return command_logits, args_logits
 
 # --- 顶级解码器 ---
 
 class LLM2CADDecoder(nn.Module):
-    """双解码器，将 LLM 特征转换为 CAD 序列。"""
+    """单解码器消融版本：共享主干 + 双输出头。"""
     def __init__(self, cfg: MechCADConfig):
         super().__init__()
         self.d_model = cfg.d_model
@@ -159,8 +124,7 @@ class LLM2CADDecoder(nn.Module):
             nn.Linear(cfg.d_model * 2, cfg.d_model),
             nn.LayerNorm(cfg.d_model),
         )
-        self.command_decoder = CommandDecoder(cfg)
-        self.args_decoder = ArgsDecoder(cfg)
+        self.shared_decoder = SharedCADDecoder(cfg)
 
         # 确保所有参数为 float32 (避免 LLaVA float16 导致溢出)
         self.float()
@@ -172,8 +136,9 @@ class LLM2CADDecoder(nn.Module):
         z = self.adapter(llm_features)
         z = z.permute(1, 0, 2)  # [LLM_Seq_Len, Batch, d_model]
 
-        command_logits, guidance = self.command_decoder(z, memory_key_padding_mask)
-        unified_args_logits = self.args_decoder(z, guidance, memory_key_padding_mask)
+        command_logits, unified_args_logits = self.shared_decoder(
+            z, memory_key_padding_mask
+        )
 
         # 置换到 [Batch, Seq_Len, ...] 以进行损失计算
         command_logits = command_logits.permute(1, 0, 2)
@@ -330,4 +295,3 @@ class MechCADModel(nn.Module):
             'command_logits': command_logits,
             'unified_args_logits': unified_args_logits,
         }
-
