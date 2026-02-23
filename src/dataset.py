@@ -18,7 +18,7 @@ if project_root not in sys.path:
 from cadlib.macro import *
 from src.unified_vocab.converter import convert_13d_to_unified_tokens
 
-CLEAN_CACHE_VERSION = 3
+CLEAN_CACHE_VERSION = 4
 
 class OmniCADDataset(Dataset):
     """
@@ -193,9 +193,12 @@ class OmniCADDataset(Dataset):
     def _is_sample_valid(self, h5_path):
         try:
             with h5py.File(h5_path, 'r') as fp:
-                if 'vec' not in fp:
+                if 'vec' in fp:
+                    cad_vec_17d = fp['vec'][:]  # type: ignore
+                elif 'out_vec' in fp:
+                    cad_vec_17d = fp['out_vec'][:]  # type: ignore
+                else:
                     return False
-                cad_vec_17d = fp['vec'][:]  # type: ignore
         except Exception:
             return False
 
@@ -356,7 +359,12 @@ class OmniCADDataset(Dataset):
         # 1. 加载并转换CAD向量序列
         try:
             with h5py.File(h5_path, 'r') as fp:
-                cad_vec_17d = fp['vec'][:]  # type:ignore
+                if 'vec' in fp:
+                    cad_vec_17d = fp['vec'][:]  # type: ignore
+                elif 'out_vec' in fp:
+                    cad_vec_17d = fp['out_vec'][:]  # type: ignore
+                else:
+                    raise KeyError("h5 file missing both 'vec' and 'out_vec'")
 
             # 将17维向量序列转换为13维
             cad_vec_13d = np.array([self._convert_17d_to_13d(v) for v in cad_vec_17d], dtype=np.int32)  # type:ignore

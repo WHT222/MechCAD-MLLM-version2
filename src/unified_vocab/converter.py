@@ -14,8 +14,96 @@ from .vocab import (
     BT_SKETCH_X_START, BT_SKETCH_X_END,
     BT_SKETCH_Y_START, BT_SKETCH_Y_END,
     param_to_token, angle_to_token, pos_to_token,
-    MAX_ARGS_PER_CMD
+    MAX_ARGS_PER_CMD, VOCAB_SIZE,
+    PARAM_OFFSET, ANGLE_OFFSET, POS_OFFSET,
+    get_param_type_masks, get_boundary_token_targets,
 )
+
+
+_TYPE_MASKS = get_param_type_masks()
+_PARAM_MASK = _TYPE_MASKS['param_mask'].astype(bool)
+_ANGLE_MASK = _TYPE_MASKS['angle_mask'].astype(bool)
+_POS_MASK = _TYPE_MASKS['pos_mask'].astype(bool)
+_SEP_MASK = _TYPE_MASKS['sep_mask'].astype(bool)
+
+
+def _argmax_in_range(logits_1d: np.ndarray, low: int, high: int) -> int:
+    """在指定 token 范围内做 argmax，避免跨类型误解码。"""
+    low = int(max(0, low))
+    high = int(min(VOCAB_SIZE, high))
+    if high <= low:
+        return low
+    return int(low + np.argmax(logits_1d[low:high]))
+
+
+def constrained_argmax_args_tokens(commands: np.ndarray, args_logits: np.ndarray) -> np.ndarray:
+    """
+    对 unified args logits 进行类型约束解码（按命令与槽位类型）。
+
+    Args:
+        commands: [S] 命令序列
+        args_logits: [S, MAX_ARGS_PER_CMD, VOCAB_SIZE] 参数 logits
+
+    Returns:
+        args_tokens: [S, MAX_ARGS_PER_CMD] 约束后的参数 token
+    """
+    commands = np.asarray(commands, dtype=np.int32)
+    args_logits = np.asarray(args_logits)
+
+    if args_logits.ndim != 3:
+        raise ValueError(f"args_logits 应为 [S, N_ARGS, V]，得到 {args_logits.shape}")
+    s, n_args, vocab_size = args_logits.shape
+    if commands.shape[0] != s:
+        raise ValueError(f"commands 与 args_logits 长度不一致: {commands.shape[0]} vs {s}")
+    if n_args != MAX_ARGS_PER_CMD:
+        raise ValueError(f"N_ARGS 应为 {MAX_ARGS_PER_CMD}，得到 {n_args}")
+    if vocab_size != VOCAB_SIZE:
+        raise ValueError(f"VOCAB_SIZE 应为 {VOCAB_SIZE}，得到 {vocab_size}")
+
+    out = np.full((s, n_args), PAD_TOKEN, dtype=np.int32)
+
+    for i in range(s):
+        cmd = int(np.clip(commands[i], 0, _PARAM_MASK.shape[0] - 1))
+        boundary_targets = get_boundary_token_targets(cmd)
+
+        for j in range(n_args):
+            # 固定边界 token 优先
+            if j < len(boundary_targets) and boundary_targets[j] is not None:
+                out[i, j] = int(boundary_targets[j])
+                continue
+
+            if _SEP_MASK[cmd, j]:
+                out[i, j] = SEP_TOKEN
+            elif _PARAM_MASK[cmd, j]:
+                out[i, j] = _argmax_in_range(args_logits[i, j], PARAM_OFFSET, ANGLE_OFFSET)
+            elif _ANGLE_MASK[cmd, j]:
+                out[i, j] = _argmax_in_range(args_logits[i, j], ANGLE_OFFSET, POS_OFFSET)
+            elif _POS_MASK[cmd, j]:
+                out[i, j] = _argmax_in_range(args_logits[i, j], POS_OFFSET, VOCAB_SIZE)
+            else:
+                out[i, j] = PAD_TOKEN
+
+    return out
+
+
+def constrained_logits_to_13d(command_logits: np.ndarray, args_logits: np.ndarray) -> np.ndarray:
+    """
+    从 logits 直接解码为 13D CAD 向量，包含命令与参数类型约束。
+
+    Args:
+        command_logits: [S, n_commands]
+        args_logits: [S, MAX_ARGS_PER_CMD, VOCAB_SIZE]
+
+    Returns:
+        cad_vec_13d: [S, 13]
+    """
+    command_logits = np.asarray(command_logits)
+    if command_logits.ndim != 2:
+        raise ValueError(f"command_logits 应为 [S, n_commands]，得到 {command_logits.shape}")
+
+    commands = np.argmax(command_logits, axis=-1).astype(np.int32)
+    args_tokens = constrained_argmax_args_tokens(commands, args_logits)
+    return unified_tokens_to_13d(commands, args_tokens)
 
 
 def convert_13d_to_unified_tokens(cad_vec_13d: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:

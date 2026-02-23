@@ -107,8 +107,11 @@ class SegEDangELEvaluator:
                 return None
 
             # Convert CAD shape to mesh via temporary STL.
-            with tempfile.NamedTemporaryFile(suffix=".stl", delete=False) as f:
-                stl_path = f.name
+            # Avoid pre-creating the file; OCC warns when target already exists.
+            fd, stl_path = tempfile.mkstemp(suffix=".stl")
+            os.close(fd)
+            if os.path.exists(stl_path):
+                os.remove(stl_path)
             try:
                 self._write_stl_file(shape, stl_path)
                 mesh = self._trimesh.load(stl_path, force="mesh")
@@ -176,4 +179,3 @@ class SegEDangELEvaluator:
             "valid_count": valid,
             "failed_count": failed,
         }
-

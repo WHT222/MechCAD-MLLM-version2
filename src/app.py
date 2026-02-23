@@ -36,7 +36,7 @@ import torch
 from PIL import Image
 
 from src.model.model import MechCADModel, MechCADConfig
-from src.unified_vocab.converter import unified_tokens_to_13d
+from src.unified_vocab.converter import constrained_logits_to_13d
 from src.utils.cad_export import export_from_cad13
 from cadlib.macro import *
 
@@ -132,10 +132,10 @@ def generate_cad(text_input, image_input, use_image, export_stl, preview_mode):
         cmd_logits = outputs['command_logits']
         args_logits = outputs['unified_args_logits']
 
-        pred_commands = cmd_logits.argmax(dim=-1).squeeze(0).cpu().numpy()
-        pred_args_tokens = args_logits.argmax(dim=-1).squeeze(0).cpu().numpy()
-
-        cad_vec = unified_tokens_to_13d(pred_commands, pred_args_tokens)
+        cad_vec = constrained_logits_to_13d(
+            cmd_logits.squeeze(0).cpu().numpy(),
+            args_logits.squeeze(0).cpu().numpy(),
+        )
 
         # 截断到 EOS
         cad_vec, valid_length = truncate_at_eos(cad_vec)

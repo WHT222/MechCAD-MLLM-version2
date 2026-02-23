@@ -202,8 +202,8 @@ def parse_args():
                         help="PerceiverFusion 可学习查询数量 (默认64)")
 
     # 学习率调度
-    parser.add_argument("--use_cosine_decay", action="store_true",
-                        help="启用 Warmup + Cosine Decay 学习率调度")
+    parser.add_argument("--use_cosine_decay", action=argparse.BooleanOptionalAction, default=True,
+                        help="是否启用 Warmup + Cosine Decay 学习率调度 (默认启用)")
     parser.add_argument("--min_lr", type=float, default=1e-6,
                         help="Cosine Decay 最小学习率 (默认1e-6)")
     parser.add_argument("--metrics_output", type=str, default=None,

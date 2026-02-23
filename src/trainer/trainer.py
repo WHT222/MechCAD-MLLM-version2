@@ -680,26 +680,20 @@ class MechCADTrainer(BaseTrainer):
         Returns:
             cad_vec: [B, S, 13] numpy 数组
         """
-        from src.unified_vocab.converter import unified_tokens_to_13d
+        from src.unified_vocab.converter import constrained_logits_to_13d
 
         cmd_logits = outputs['command_logits']
         unified_args_logits = outputs['unified_args_logits']
 
-        # 命令预测
-        pred_commands = cmd_logits.argmax(dim=-1)  # [B, S]
-
-        # 参数token预测
-        pred_args_tokens = unified_args_logits.argmax(dim=-1)  # [B, S, MAX_ARGS_PER_CMD]
-
-        # 转换为numpy
-        pred_commands_np = pred_commands.detach().cpu().numpy()
-        pred_args_tokens_np = pred_args_tokens.detach().cpu().numpy()
+        # 转换为 numpy logits
+        cmd_logits_np = cmd_logits.detach().cpu().numpy()             # [B, S, n_commands]
+        args_logits_np = unified_args_logits.detach().cpu().numpy()   # [B, S, N_ARGS, VOCAB]
 
         # 批量转换为13维CAD向量
-        B, S = pred_commands_np.shape
+        B = cmd_logits_np.shape[0]
         cad_vecs = []
         for b in range(B):
-            cad_vec = unified_tokens_to_13d(pred_commands_np[b], pred_args_tokens_np[b])
+            cad_vec = constrained_logits_to_13d(cmd_logits_np[b], args_logits_np[b])
             cad_vecs.append(cad_vec)
 
         return np.stack(cad_vecs, axis=0)  # [B, S, 13]

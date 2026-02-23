@@ -14,6 +14,15 @@ import os
 import trimesh
 from trimesh.sample import sample_surface
 import random
+import numpy as np
+
+
+def _to_float3(vec, name="vec3"):
+    """Convert array-like to a Python-float triplet for pythonOCC constructors."""
+    arr = np.asarray(vec, dtype=np.float64).reshape(-1)
+    if arr.size < 3:
+        raise ValueError(f"{name} must have at least 3 values, got shape={np.asarray(vec).shape}")
+    return float(arr[0]), float(arr[1]), float(arr[2])
 
 
 def vec2CADsolid(vec, is_numerical=True, n=256):
@@ -46,14 +55,15 @@ def create_by_extrude(extrude_op: Extrude):
     sketch_plane.origin = extrude_op.sketch_pos
 
     face = create_profile_face(profile, sketch_plane)
-    normal = gp_Dir(*extrude_op.sketch_plane.normal)
-    ext_vec = gp_Vec(normal).Multiplied(extrude_op.extent_one)
+    n_x, n_y, n_z = _to_float3(extrude_op.sketch_plane.normal, "sketch_plane.normal")
+    normal = gp_Dir(n_x, n_y, n_z)
+    ext_vec = gp_Vec(normal).Multiplied(float(extrude_op.extent_one))
     body = BRepPrimAPI_MakePrism(face, ext_vec).Shape()
     if extrude_op.extent_type == EXTENT_TYPE.index("SymmetricFeatureExtentType"):
         body_sym = BRepPrimAPI_MakePrism(face, ext_vec.Reversed()).Shape()
         body = BRepAlgoAPI_Fuse(body, body_sym).Shape()
     if extrude_op.extent_type == EXTENT_TYPE.index("TwoSidesFeatureExtentType"):
-        ext_vec = gp_Vec(normal.Reversed()).Multiplied(extrude_op.extent_two)
+        ext_vec = gp_Vec(normal.Reversed()).Multiplied(float(extrude_op.extent_two))
         body_two = BRepPrimAPI_MakePrism(face, ext_vec).Shape()
         body = BRepAlgoAPI_Fuse(body, body_two).Shape()
     return body
@@ -61,9 +71,12 @@ def create_by_extrude(extrude_op: Extrude):
 
 def create_profile_face(profile: Profile, sketch_plane: CoordSystem):
     """从草图轮廓和草图平面创建面"""
-    origin = gp_Pnt(*sketch_plane.origin)
-    normal = gp_Dir(*sketch_plane.normal)
-    x_axis = gp_Dir(*sketch_plane.x_axis)
+    o_x, o_y, o_z = _to_float3(sketch_plane.origin, "sketch_plane.origin")
+    n_x, n_y, n_z = _to_float3(sketch_plane.normal, "sketch_plane.normal")
+    x_x, x_y, x_z = _to_float3(sketch_plane.x_axis, "sketch_plane.x_axis")
+    origin = gp_Pnt(o_x, o_y, o_z)
+    normal = gp_Dir(n_x, n_y, n_z)
+    x_axis = gp_Dir(x_x, x_y, x_z)
     gp_face = gp_Pln(gp_Ax3(origin, normal, x_axis))
 
     all_loops = [create_loop_3d(loop, sketch_plane) for loop in profile.children]
@@ -103,7 +116,8 @@ def create_edge_3d(curve: CurveBase, sketch_plane: CoordSystem):
         topo_edge = BRepBuilderAPI_MakeEdge(start_point, end_point)
     elif isinstance(curve, Circle):
         center = point_local2global(curve.center, sketch_plane)
-        axis = gp_Dir(*sketch_plane.normal)
+        n_x, n_y, n_z = _to_float3(sketch_plane.normal, "sketch_plane.normal")
+        axis = gp_Dir(n_x, n_y, n_z)
         gp_circle = gp_Circ(gp_Ax2(center, axis), abs(float(curve.radius)))
         topo_edge = BRepBuilderAPI_MakeEdge(gp_circle)
     elif isinstance(curve, Arc):
@@ -122,7 +136,8 @@ def point_local2global(point, sketch_plane: CoordSystem, to_gp_Pnt=True):
     """将草图平面局部坐标中的点转换为全局坐标"""
     g_point = point[0] * sketch_plane.x_axis + point[1] * sketch_plane.y_axis + sketch_plane.origin
     if to_gp_Pnt:
-        return gp_Pnt(*g_point)
+        x, y, z = _to_float3(g_point, "global_point")
+        return gp_Pnt(x, y, z)
     return g_point
 
 

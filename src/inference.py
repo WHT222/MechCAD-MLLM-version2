@@ -26,7 +26,7 @@ if project_root not in sys.path:
     sys.path.append(project_root)
 
 from src.model.model import MechCADModel, MechCADConfig
-from src.unified_vocab.converter import unified_tokens_to_13d
+from src.unified_vocab.converter import constrained_logits_to_13d
 from src.utils.cad_export import export_from_cad13
 from cadlib.macro import *
 
@@ -116,11 +116,11 @@ def generate_cad(model, text, image_path=None, text_only=True):
     cmd_logits = outputs['command_logits']
     args_logits = outputs['unified_args_logits']
 
-    pred_commands = cmd_logits.argmax(dim=-1).squeeze(0).cpu().numpy()  # [S]
-    pred_args_tokens = args_logits.argmax(dim=-1).squeeze(0).cpu().numpy()  # [S, n_args]
-
-    # 转换为 13D CAD 向量
-    cad_vec = unified_tokens_to_13d(pred_commands, pred_args_tokens)
+    # 转换为 13D CAD 向量（类型约束解码）
+    cad_vec = constrained_logits_to_13d(
+        cmd_logits.squeeze(0).cpu().numpy(),
+        args_logits.squeeze(0).cpu().numpy(),
+    )
 
     return cad_vec, outputs
 
